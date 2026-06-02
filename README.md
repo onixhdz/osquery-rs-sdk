@@ -271,7 +271,7 @@ This project was influenced by [osquery-go](https://github.com/osquery/osquery-g
 [crate-link]: https://crates.io/crates/osquery-rs-sdk
 [docs-image]: https://docs.rs/osquery-rs-sdk/badge.svg
 [docs-link]: https://docs.rs/osquery-rs-sdk
-[ci-image]: https://github.com/realxen/osquery-rs-sdk/actions/workflows/ci.yml/badge.svg
-[ci-link]: https://github.com/realxen/osquery-rs-sdk/actions/workflows/ci.yml
+[ci-image]: https://github.com/onixhdz/osquery-rs-sdk/actions/workflows/ci.yml/badge.svg
+[ci-link]: https://github.com/onixhdz/osquery-rs-sdk/actions/workflows/ci.yml
 [license-image]: https://img.shields.io/badge/license-MIT-blue.svg
-[license-link]: https://github.com/realxen/osquery-rs-sdk/blob/main/LICENSE
+[license-link]: https://github.com/onixhdz/osquery-rs-sdk/blob/main/LICENSE
