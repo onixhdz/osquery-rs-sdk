@@ -312,10 +312,24 @@ where
     match helper {
         // string indicates empty list in osquery
         Value::String(s) if s.is_empty() => Ok(Vec::new()),
-        val => match serde_json::from_value(val) {
-            Ok::<Vec<Constraint>, _>(res) => Ok(res),
-            Err(err) => Err(de::Error::custom(format!("unexpected context list: {err}"))),
-        },
+        Value::Array(items) => Ok(items
+            .into_iter()
+            // Skip unparseable constraints: osquery re-applies the WHERE
+            // clause anyway, so dropping a pushdown hint is safe.
+            .filter_map(|item| match serde_json::from_value::<Constraint>(item) {
+                Ok(constraint) => Some(constraint),
+                #[cfg(feature = "tracing")]
+                Err(err) => {
+                    tracing::warn!("skipping unparseable constraint: {err}");
+                    None
+                }
+                #[cfg(not(feature = "tracing"))]
+                Err(_) => None,
+            })
+            .collect()),
+        val => Err(de::Error::custom(format!(
+            "unexpected context list: invalid value {val}, expected array"
+        ))),
     }
 }
 
@@ -355,6 +369,13 @@ pub enum Operator {
     Regexp = 67,
     Unique = 1,
     In = 3,
+    NotEquals = 68,
+    IsNot = 69,
+    IsNotNull = 70,
+    IsNull = 71,
+    Is = 72,
+    Limit = 73,
+    Offset = 74,
 }
 
 impl fmt::Display for Operator {
@@ -371,6 +392,13 @@ impl fmt::Display for Operator {
             Operator::Regexp => write!(f, "REGEXP"),
             Operator::Unique => write!(f, "UNIQUE"),
             Operator::In => write!(f, "IN"),
+            Operator::NotEquals => write!(f, "!="),
+            Operator::IsNot => write!(f, "IS NOT"),
+            Operator::IsNotNull => write!(f, "IS NOT NULL"),
+            Operator::IsNull => write!(f, "IS NULL"),
+            Operator::Is => write!(f, "IS"),
+            Operator::Limit => write!(f, "LIMIT"),
+            Operator::Offset => write!(f, "OFFSET"),
         }
     }
 }
@@ -416,6 +444,13 @@ impl TryFrom<i64> for Operator {
             67 => Ok(Operator::Regexp),
             1 => Ok(Operator::Unique),
             3 => Ok(Operator::In),
+            68 => Ok(Operator::NotEquals),
+            69 => Ok(Operator::IsNot),
+            70 => Ok(Operator::IsNotNull),
+            71 => Ok(Operator::IsNull),
+            72 => Ok(Operator::Is),
+            73 => Ok(Operator::Limit),
+            74 => Ok(Operator::Offset),
             _ => Err(InvalidOperator(value)),
         }
     }
@@ -1166,6 +1201,52 @@ mod tests {
     }
 
     #[test]
+    fn generate_with_new_and_unknown_operators() {
+        let mut seen_constraints = Vec::new();
+        let mut plugin = TablePlugin::new("mock", vec![ColumnDefinition::text("result")], |qctx| {
+            seen_constraints = qctx
+                .get("result")
+                .map(|list| list.constraints().to_vec())
+                .unwrap_or_default();
+            Ok(vec![BTreeMap::from([(
+                "result".to_string(),
+                "passed".to_string(),
+            )])])
+        });
+
+        let context = r#"{"constraints": [
+            {
+                "name": "result",
+                "affinity": "TEXT",
+                "list": [
+                    {"op": 68, "expr": "pending"},
+                    {"op": 73, "expr": "3"},
+                    {"op": 9999, "expr": "ignored"}
+                ]
+            }
+        ]}"#;
+        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
+            (String::from("action"), String::from("generate")),
+            (String::from("context"), String::from(context)),
+        ]));
+        assert_eq!(0, resp.status.unwrap().code.unwrap());
+        assert_eq!(1, resp.response.unwrap().len());
+        assert_eq!(
+            vec![
+                Constraint {
+                    operator: Operator::NotEquals,
+                    expression: "pending".to_string(),
+                },
+                Constraint {
+                    operator: Operator::Limit,
+                    expression: "3".to_string(),
+                },
+            ],
+            seen_constraints
+        );
+    }
+
+    #[test]
     fn column_type() {
         let test_cases = vec![
             (ColumnType::BigInt, r#"{ "affinity":"BIGINT" }"#),
@@ -1193,6 +1274,14 @@ mod tests {
             (false, Operator::Glob, r#"{ "op": 66 }"#),
             (false, Operator::Regexp, r#"{ "op": 67 }"#),
             (false, Operator::Unique, r#"{ "op": 1 }"#),
+            (false, Operator::In, r#"{ "op": 3 }"#),
+            (false, Operator::NotEquals, r#"{ "op": 68 }"#),
+            (false, Operator::IsNot, r#"{ "op": 69 }"#),
+            (false, Operator::IsNotNull, r#"{ "op": 70 }"#),
+            (false, Operator::IsNull, r#"{ "op": 71 }"#),
+            (false, Operator::Is, r#"{ "op": 72 }"#),
+            (false, Operator::Limit, r#"{ "op": 73 }"#),
+            (false, Operator::Offset, r#"{ "op": 74 }"#),
             (true, Operator::Unique, r#"{ "op": 9999 }"#),
             // from &str
             (false, Operator::Equals, r#"{ "op": "2" }"#),
@@ -1205,6 +1294,8 @@ mod tests {
             (false, Operator::Glob, r#"{ "op": "66" }"#),
             (false, Operator::Regexp, r#"{ "op": "67" }"#),
             (false, Operator::Unique, r#"{ "op": "1" }"#),
+            (false, Operator::NotEquals, r#"{ "op": "68" }"#),
+            (false, Operator::Limit, r#"{ "op": "73" }"#),
             (true, Operator::Unique, r#"{ "op": "9999" }"#),
         ];
         for (should_err, typ, data) in test_cases {
@@ -1242,6 +1333,31 @@ mod tests {
             (
                 false,
                 r#"{"affinity":"BIGINT", "list": [{"op":"2","expr":"foo"}] }"#,
+                Some(vec![Constraint {
+                    operator: Operator::Equals,
+                    expression: "foo".to_string(),
+                }]),
+            ),
+            (
+                false,
+                r#"{"affinity":"TEXT", "list": [{"op":68,"expr":"pending"}] }"#,
+                Some(vec![Constraint {
+                    operator: Operator::NotEquals,
+                    expression: "pending".to_string(),
+                }]),
+            ),
+            (
+                false,
+                r#"{"affinity":"INTEGER", "list": [{"op":73,"expr":"3"}] }"#,
+                Some(vec![Constraint {
+                    operator: Operator::Limit,
+                    expression: "3".to_string(),
+                }]),
+            ),
+            // unknown operators are skipped, not fatal
+            (
+                false,
+                r#"{"affinity":"TEXT", "list": [{"op":9999,"expr":"x"},{"op":2,"expr":"foo"}] }"#,
                 Some(vec![Constraint {
                     operator: Operator::Equals,
                     expression: "foo".to_string(),
