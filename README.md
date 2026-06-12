@@ -5,21 +5,28 @@
 [![CI][ci-image]][ci-link]
 [![MIT Licensed][license-image]][license-link]
 
-A feature-complete Rust SDK for building [osquery](https://osquery.io) extensions -- custom tables (read-only and writable), loggers, config providers, and distributed query handlers as native binaries that plug into `osqueryd` or `osqueryi`.
+A feature-complete Rust SDK for building [osquery](https://osquery.io) extensions: custom tables, writable tables, loggers, config providers, and distributed query handlers that connect to `osqueryd` or `osqueryi` through osquery's extension socket.
+
+osquery exposes operating system state as SQL tables. Extensions let you add more tables and plugin behavior without patching osquery itself.
+
+## What is osquery-rs-sdk?
+
+This crate provides a Rust SDK for osquery's extension API. An extension is a normal executable: create an `ExtensionManagerServer`, register the plugins it should expose, and run it against the extension socket used by `osqueryd` or `osqueryi`.
+
+There is no C/C++ build step for users of the crate. On Linux and macOS the SDK talks to osquery over Unix sockets; on Windows it uses named pipes. For lower-level details on the extension lifecycle, see the osquery [SDK documentation](https://osquery.readthedocs.io/en/latest/development/osquery-sdk/).
 
 ## Features
 
-- **Table plugins** -- Create custom virtual tables queryable with SQL, including writable tables with INSERT/UPDATE/DELETE support
-- **Logger plugins** -- Implement custom logging backends for osquery events and results
-- **Config plugins** -- Provide dynamic configuration sources for osquery
-- **Distributed plugins** -- Handle distributed query scheduling and result collection
-- **Client API** -- Connect to a running osquery instance and execute queries from Rust
-- **Mock support** -- First-class mocks for unit testing extensions without a live osquery
-- **Builder API** -- Configure extensions with version strings, timeouts, and ping intervals
-- **Signal handling** -- Built-in SIGINT/SIGTERM (Unix) and Ctrl+C (Windows) handling with `ShutdownHandle` for cross-thread shutdown
-- **Cross-platform** -- Unix sockets on Linux/macOS and named pipes on Windows
-- **Pure Rust** -- No C/C++ dependencies, built on the Thrift protocol
-- **Minimal footprint** -- Thin layer over osquery's extension API with zero unnecessary overhead
+- **Table plugins:** Define virtual tables queryable with SQL, including writable tables with INSERT/UPDATE/DELETE handlers
+- **Logger plugins:** Handle osquery event and result logs
+- **Config plugins:** Provide dynamic config and generate query packs on demand
+- **Distributed plugins:** Serve distributed queries and collect results
+- **Client API:** Query a running osquery instance from Rust
+- **Custom plugins:** Implement `OsqueryPlugin` directly for behavior beyond the built-in plugin types
+- **Mock support:** Test extension code without a live `osqueryd`
+- **Builder API:** Set version strings, timeouts, and ping intervals
+- **Signal handling:** Handle SIGINT/SIGTERM on Unix and Ctrl+C on Windows
+- **Cross-platform transport:** Unix sockets on Linux/macOS and named pipes on Windows
 
 ## Quick start
 
@@ -27,7 +34,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-osquery-rs-sdk = "0.1"
+osquery-rs-sdk = "0.2.0"
 ```
 
 ### Query a running osquery instance
@@ -35,9 +42,26 @@ osquery-rs-sdk = "0.1"
 ```rust
 fn main() -> osquery_rs_sdk::Result<()> {
     let mut client = osquery_rs_sdk::ExtensionManagerClient::connect()?;
-    let rows = client.query_rows("SELECT * FROM users LIMIT 5")?;
+    let rows = client.query("SELECT * FROM users LIMIT 5")?;
     println!("{rows:?}");
     Ok(())
+}
+```
+
+### Handle errors
+
+Transport failures and osquery-level failures are distinct error variants,
+so retry logic never needs to parse message strings:
+
+```rust
+use osquery_rs_sdk::Error;
+
+match client.query("SELECT * FROM maybe_missing") {
+    Ok(rows) => println!("{rows:?}"),
+    // osquery replied: bad SQL, unknown table, ... Do not retry.
+    Err(Error::Status { code, message }) => eprintln!("query failed ({code}): {message}"),
+    // Connection problem: may succeed after reconnecting.
+    Err(other) => return Err(other),
 }
 ```
 
@@ -72,7 +96,7 @@ fn generate(_ctx: QueryContext) -> Result<Table> {
 
 ### Create a writable table
 
-Tables with INSERT, UPDATE, and DELETE support implement the `WritableTable` trait:
+Implement `WritableTable` when osquery should be able to mutate table state:
 
 ```rust
 use osquery_rs_sdk::{
@@ -105,7 +129,7 @@ fn main() -> Result<()> {
 }
 ```
 
-The trait gives each method direct `&mut self` access to your struct's state -- no `Arc<Mutex<>>` needed.
+Writable table methods receive `&mut self`, so table state can usually live on the plugin struct instead of behind a lock.
 
 ### Create a logger plugin
 
@@ -137,7 +161,7 @@ fn main() -> Result<()> {
     let mut server = ExtensionManagerServer::new("my_config", "/var/osquery/osquery.em")?;
     server.register_plugin(
         ConfigPlugin::new("my_config", generate_config)
-            .with_gen_pack(|name, _value| {
+            .with_gen_pack(|_name, _value| {
                 // Resolve query packs on demand (e.g. fetch from a remote source)
                 Ok(format!(r#"{{"queries":{{"q1":{{"query":"SELECT 1;","interval":60}}}}}}"#))
             }),
@@ -153,9 +177,9 @@ fn generate_config() -> Result<BTreeMap<String, String>> {
 }
 ```
 
-### Signal handling and graceful shutdown
+### Graceful shutdown
 
-Use `run_with_signal_handling()` to automatically handle SIGINT/SIGTERM (Unix) or Ctrl+C (Windows):
+`run_with_signal_handling()` handles SIGINT/SIGTERM on Unix and Ctrl+C on Windows:
 
 ```rust
 let mut server = ExtensionManagerServer::new("my_ext", "/var/osquery/osquery.em")?;
@@ -163,7 +187,7 @@ let mut server = ExtensionManagerServer::new("my_ext", "/var/osquery/osquery.em"
 server.run_with_signal_handling()?;
 ```
 
-For programmatic shutdown from another thread, use `ShutdownHandle`:
+Use `ShutdownHandle` when another thread needs to stop the server:
 
 ```rust
 use osquery_rs_sdk::ExtensionManagerServer;
@@ -172,77 +196,85 @@ let mut server = ExtensionManagerServer::new("my_ext", "/var/osquery/osquery.em"
 let handle = server.shutdown_handle();
 
 std::thread::spawn(move || {
-    // Trigger shutdown from any thread
     handle.shutdown();
 });
 
 server.run()?;
 ```
 
-### Use the builder for advanced configuration
+### Server configuration
 
 ```rust
-use osquery_rs_sdk::ExtensionManagerServer;
+use osquery_rs_sdk::{ExtensionManagerServer, Result};
 use std::time::Duration;
 
-let server = ExtensionManagerServer::builder("my_ext", "/var/osquery/osquery.em")
-    .version("1.0.0")
-    .ping_interval(Duration::from_secs(10))
-    .build()
-    .unwrap();
+fn main() -> Result<()> {
+    let mut server = ExtensionManagerServer::builder("my_ext", "/var/osquery/osquery.em")
+        .version("1.0.0")
+        .ping_interval(Duration::from_secs(10))
+        .build()?;
+
+    // ... register plugins ...
+    server.run()
+}
 ```
 
 ## Feature flags
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `client` | -- | Client-only API for querying osquery |
-| `server` | yes | Extension server (includes `client`) |
-| `plugins` | yes | Table, logger, config, and distributed plugins (includes `server`) |
-| `mock` | -- | Mock implementations for testing |
-| `tracing` | -- | Structured logging via the `tracing` crate |
+| Flag      | Default | Description                                                           |
+| --------- | ------- | --------------------------------------------------------------------- |
+| `client`  | no      | Client API for querying osquery                                       |
+| `server`  | yes     | Extension server; also enables `client`                               |
+| `plugins` | yes     | Table, logger, config, and distributed plugins; also enables `server` |
+| `mock`    | no      | Mock implementations for tests                                        |
+| `tracing` | no      | Structured logging through the `tracing` crate                        |
 
-## Loading extensions with osqueryd
+## Loading an extension with osqueryd
 
-1. Build your extension and rename it with the `.ext` suffix:
+osquery only loads extension binaries from paths it trusts. A typical root-run `osqueryd` setup looks like this:
+
+1. Build the extension and give the binary a `.ext` suffix:
 
 ```bash
 cargo build --release --example table
 cp target/release/examples/table target/release/examples/table.ext
 ```
 
-2. Ensure the directory is only writable by the osqueryd user (typically root):
+2. Put the extension somewhere only root or the osqueryd service owner can write to:
 
 ```bash
-sudo chown -R root /usr/local/osquery_extensions/
+sudo mkdir -p /usr/local/osquery_extensions
+sudo chown root:root /usr/local/osquery_extensions
+sudo chmod 755 /usr/local/osquery_extensions
 sudo cp target/release/examples/table.ext /usr/local/osquery_extensions/
 ```
 
-3. Create an `extensions.load` file listing your extension:
+3. Create an `extensions.load` file in a trusted location:
 
 ```bash
-echo "/usr/local/osquery_extensions/table.ext" > /tmp/extensions.load
+sudo mkdir -p /etc/osquery
+echo "/usr/local/osquery_extensions/table.ext" | sudo tee /etc/osquery/extensions.load >/dev/null
 ```
 
-4. Start osqueryd with autoloading:
+4. Start osqueryd with extension autoloading:
 
 ```bash
-sudo osqueryd --extensions_autoload=/tmp/extensions.load --verbose
+sudo osqueryd --extensions_autoload=/etc/osquery/extensions.load --verbose
 ```
 
 ## Testing
 
 ```bash
-# Unit tests (no osquery required)
-cargo test
+# Unit tests, no osqueryd required
+cargo test --all-features
 
-# Full suite including integration tests (requires osqueryd)
-cargo test -- --include-ignored
+# Full suite, including ignored tests that require a live osqueryd
+cargo test --all-features -- --include-ignored
 ```
 
 ## Dev container
 
-The repository includes a `.devcontainer/` setup that installs Rust, the Thrift compiler, and `osqueryd` inside the container. The daemon starts automatically on the standard socket path (`/var/osquery/osquery.em`), so the full test suite works out of the box:
+The `.devcontainer/` setup installs Rust, the Thrift compiler, and `osqueryd`. It also starts `osqueryd` on the standard socket path (`/var/osquery/osquery.em`), so the ignored integration tests can run inside the container:
 
 ```bash
 cargo test --all-features -- --include-ignored
@@ -255,9 +287,13 @@ Restart the daemon manually if needed:
 .devcontainer/scripts/start-osqueryd.sh
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local development, testing, and pull request guidelines.
+
 ## Security
 
-Please see [SECURITY.md](SECURITY.md).
+Please report vulnerabilities privately. See [SECURITY.md](SECURITY.md) for details.
 
 ## License
 

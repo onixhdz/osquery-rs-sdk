@@ -1,6 +1,6 @@
 [package]
 name = "osquery-rs-sdk"
-version = "0.1.1"
+version = "0.2.0"
 description = "Rust SDK for building osquery extensions — tables, loggers, config providers, and distributed query handlers."
 readme = "README.md"
 authors = ["onixhdz <86901550+onixhdz@users.noreply.github.com>"]
