@@ -71,7 +71,7 @@ crate-type = ["bin"]
 required-features = ["plugins"]
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.7", features = ["html_reports"] }
 serial_test = "3"
 serde_json = "1"
 
