@@ -12,6 +12,17 @@ This crate ships into security-sensitive environments and promises a thin, zero-
 - New dependencies must be optional behind a feature unless `client` itself needs them, and must pass `cargo deny` and `cargo audit`.
 - Do not use language features newer than the pinned `rust-version` without bumping it deliberately.
 
+## Product Principles
+
+Apply these to every contract-affecting change.
+
+- Promise only what can be kept forever. Seal traits users only consume, mark public structs and error enums `#[non_exhaustive]`, and prefer removing surface over adding it. Anything speculative stays private until proven.
+- Design errors for the operator, not the compiler. Encode the decisions callers actually make (retryable vs definitive, transport vs remote failure) as matchable variants, and carry the context needed to diagnose from logs alone.
+- Enforce invariants internally; never delegate them to callers. Validation and state folding live in one tested place, not re-implemented at every call site.
+- Enforce stability with machinery, not intentions: semver-checks CI, honest version bumps, and a CHANGELOG migration guide for every breaking release.
+- Honor performance claims structurally. Zero-cost features must compile out; the dispatch path stays allocation-free; checked operations replace panic-allows.
+- Take the boring parts seriously: tests must not flake (poll with bounded deadlines, never fixed sleeps), and rustdoc must state the actual behavior. A documented contract that one code path violates is a bug.
+
 ## Error Handling
 
 Extensions run inside the osquery process tree; a panic takes down the whole extension.
