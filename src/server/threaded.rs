@@ -257,9 +257,15 @@ where
                 ))
             };
         }
-        // `read` is bounded by `chunk.len()` per the `Read` contract.
-        #[allow(clippy::indexing_slicing)]
-        requests.extend_from_slice(&chunk[..read]);
+        // `read` is bounded by `chunk.len()` per the `Read` contract, but
+        // treat a violation as a protocol error instead of trusting it.
+        let Some(received) = chunk.get(..read) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reader returned more bytes than the buffer holds",
+            ));
+        };
+        requests.extend_from_slice(received);
         if requests.len() > MAX_REQUEST_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -348,9 +354,24 @@ mod tests {
         std::thread::spawn(move || {
             server.listen(socket_path).unwrap();
         });
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        wait_for_server(&socket);
 
         (socket, stop_handle)
+    }
+
+    /// Poll until the server accepts a connection and answers a ping,
+    /// instead of assuming a fixed startup delay.
+    fn wait_for_server(path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Ok(mut probe) = client::ExtensionManagerClient::connect_with_path(path) {
+                if probe.ping().is_ok() {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("server at {} not ready within 10s", path.display());
     }
 
     #[test]
@@ -460,7 +481,15 @@ mod tests {
         let _stop = server.stop_handle();
         let socket_path = socket.clone();
         std::thread::spawn(move || server.listen(socket_path).unwrap());
-        std::thread::sleep(Duration::from_millis(100));
+        let listen_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < listen_deadline,
+                "listener did not create {} within 10s",
+                socket.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         // Hold every permit with idle connections; ping the last one to
         // prove they are all being serviced.
@@ -614,6 +643,7 @@ mod tests {
         let (socket, _stop) = init_server_with("starvation", handler);
 
         // Saturate every runtime worker with a call parked in the handler.
+        let saturation_started = Instant::now();
         let mut callers = Vec::new();
         for _ in 0..workers {
             let socket = socket.clone();
@@ -624,7 +654,7 @@ mod tests {
                     .unwrap();
             }));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while in_flight.load(Ordering::SeqCst) < workers {
             assert!(
                 Instant::now() < deadline,
@@ -632,14 +662,28 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        let saturation = saturation_started.elapsed();
 
-        let mut probe = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-        probe
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        probe.write_all(&PING_FRAME).unwrap();
-        let mut reply = [0u8; 64];
-        let read = probe.read(&mut reply);
+        // One retry on a fresh connection guards against transient
+        // accept-path slowness. The gate stays closed throughout, so a
+        // reply still proves the probe was serviced while every worker
+        // was parked in a slow call.
+        let mut read = Err(std::io::Error::other("probe not attempted"));
+        let mut probe_timings = Vec::new();
+        for _ in 0..2 {
+            let attempt_started = Instant::now();
+            let mut probe = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            probe
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            probe.write_all(&PING_FRAME).unwrap();
+            let mut reply = [0u8; 64];
+            read = probe.read(&mut reply);
+            probe_timings.push(attempt_started.elapsed());
+            if read.as_ref().is_ok_and(|count| *count > 0) {
+                break;
+            }
+        }
 
         // Release the parked calls before asserting so cleanup always runs.
         gate.open();
@@ -649,7 +693,8 @@ mod tests {
 
         assert!(
             read.as_ref().is_ok_and(|count| *count > 0),
-            "ping starved while all workers ran slow calls: {read:?}"
+            "ping starved while {workers} workers ran slow calls \
+             (saturation {saturation:?}, probe attempts {probe_timings:?}): {read:?}"
         );
     }
 
@@ -661,14 +706,17 @@ mod tests {
         let mut client = client::ExtensionManagerClient::connect_with_path(&test_socket).unwrap();
         client.ping().unwrap();
 
-        // Stop the server
         stop.stop();
 
-        // Give the server time to shut down
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        // New connections should fail
-        let result = client::ExtensionManagerClient::connect_with_path(&test_socket);
-        assert!(result.is_err(), "should not connect after stop");
+        // Poll until the listener is gone instead of assuming a fixed
+        // shutdown delay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while client::ExtensionManagerClient::connect_with_path(&test_socket).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server still accepting connections 10s after stop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

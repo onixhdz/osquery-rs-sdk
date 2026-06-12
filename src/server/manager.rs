@@ -788,7 +788,8 @@ mod tests {
     }
 
     fn wait_for_extension_server<P: AsRef<std::path::Path>>(path: P) {
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if let Ok(mut client) = client::ExtensionManagerClient::connect_with_path(&path) {
                 if client.ping().is_ok() {
                     return;
@@ -798,7 +799,7 @@ mod tests {
         }
 
         panic!(
-            "timed out waiting for extension server at {}",
+            "timed out waiting for extension server at {} within 10s",
             path.as_ref().display()
         );
     }

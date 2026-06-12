@@ -85,18 +85,10 @@ impl<LogFunc: FnMut(LogType, &str) -> Result<()>> LoggerPlugin<LogFunc> {
     ///
     /// The callback is invoked once when the plugin is shut down,
     /// allowing loggers to flush buffers or release resources.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal shutdown lock is poisoned (should not happen
-    /// during normal construction).
     #[must_use]
-    #[allow(clippy::expect_used)] // Mutex poisoning during construction is a bug, not a runtime condition.
-    pub fn with_shutdown(self, f: impl FnOnce() + Send + Sync + 'static) -> Self {
-        *self
-            .on_shutdown
-            .lock()
-            .expect("on_shutdown lock poisoned during construction") = Some(Box::new(f));
+    pub fn with_shutdown(mut self, f: impl FnOnce() + Send + Sync + 'static) -> Self {
+        // Replace the mutex wholesale; `self` is owned, so no lock is needed.
+        self.on_shutdown = Mutex::new(Some(Box::new(f)));
         self
     }
 }
