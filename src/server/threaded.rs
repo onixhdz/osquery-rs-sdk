@@ -438,6 +438,45 @@ mod tests {
         );
     }
 
+    /// A buffered request that exceeds `MAX_REQUEST_BYTES` must close the
+    /// connection instead of growing the buffer unboundedly.
+    #[cfg(unix)]
+    #[test]
+    fn oversized_request_closes_connection() {
+        use std::io::{Read, Write};
+
+        let (test_socket, _stop) = init_server("oversized_request");
+        let mut stream = std::os::unix::net::UnixStream::connect(&test_socket).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+
+        // Strict binary call header claiming a 64 MB method name: parses as
+        // an incomplete (never-completing) request, so the server keeps
+        // buffering until the cap trips.
+        let header: [u8; 8] = [0x80, 0x01, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00];
+        stream.write_all(&header).unwrap();
+
+        // Stream filler past the cap. The server may close mid-write, which
+        // surfaces as a write error; either way it must never reply, and the
+        // read side must report the connection closed.
+        let filler = vec![0u8; 64 * 1024];
+        let mut written = header.len();
+        while written <= MAX_REQUEST_BYTES + filler.len() {
+            match stream.write_all(&filler) {
+                Ok(()) => written += filler.len(),
+                Err(_) => break, // server already closed the connection
+            }
+        }
+
+        let mut reply = [0u8; 16];
+        let read = stream.read(&mut reply).unwrap_or(0);
+        assert_eq!(
+            read, 0,
+            "server must close an oversized request without replying"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn pipelined_requests_get_individual_responses() {

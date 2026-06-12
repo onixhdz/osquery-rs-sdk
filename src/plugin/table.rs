@@ -1149,6 +1149,14 @@ mod tests {
                 String::from("bad"),
             )]))
             .unwrap_err();
+        // Missing context
+        let err = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("generate"),
+            )]))
+            .unwrap_err();
+        assert_eq!("missing query context", err.to_string());
         // Bad context JSON
         plugin
             .call(PluginRequest::from([
