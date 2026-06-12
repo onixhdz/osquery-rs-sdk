@@ -14,7 +14,21 @@
     )
 )]
 
-use std::result;
+use std::{collections::BTreeMap, result};
+
+/// A plugin request from osquery: a map of request keys to values.
+pub type PluginRequest = BTreeMap<String, String>;
+
+/// A plugin response payload: a list of rows, each mapping column names to
+/// values. This is also the shape of query results returned by the client.
+pub type PluginResponse = Vec<BTreeMap<String, String>>;
+
+/// Identifier osquery assigns to a registered extension.
+pub type ExtensionUuid = i64;
+
+/// Registry advertisement sent to osquery on registration: registry name
+/// (e.g. `"table"`) to plugin name to the plugin's route definitions.
+pub type ExtensionRegistry = BTreeMap<String, BTreeMap<String, PluginResponse>>;
 
 #[allow(
     clippy::all,
@@ -39,7 +53,7 @@ pub mod plugin;
 pub mod mock;
 
 #[cfg(feature = "client")]
-pub use crate::client::{ExtensionManager, ExtensionManagerClient};
+pub use crate::client::{ExtensionInfo, ExtensionManager, ExtensionManagerClient, OptionInfo};
 
 #[cfg(feature = "server")]
 pub use crate::server::{
@@ -71,12 +85,28 @@ pub enum Error {
     /// The message is extracted and formatted because the upstream thrift
     /// crate's `Display` impl for `ApplicationError` discards the user
     /// message and only prints the error kind label.
+    ///
+    /// The payload is diagnostic text for logs; its format is not a
+    /// contract. Match on the variant, not the message.
     #[error("{0}")]
     Transport(String),
 
     /// An I/O error.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    /// osquery replied with a non-zero status code.
+    ///
+    /// Distinct from [`Transport`](Error::Transport): transport errors may
+    /// succeed after reconnecting, while a status error is a definitive
+    /// reply from osquery and must not be retried blindly.
+    #[error("osquery status {code}: {message}")]
+    Status {
+        /// The non-zero status code returned by osquery.
+        code: i32,
+        /// The status message returned by osquery.
+        message: String,
+    },
 
     /// An error with an additional context message wrapping an inner error.
     #[error("{message} - {source}")]
@@ -89,6 +119,9 @@ pub enum Error {
     },
 
     /// A general error with a descriptive message.
+    ///
+    /// The payload is diagnostic text for logs; its format is not a
+    /// contract. Match on the variant, not the message.
     #[error("{0}")]
     Other(String),
 }

@@ -3,7 +3,7 @@
 //! Enable with the `mock` feature flag:
 //! ```toml
 //! [dev-dependencies]
-//! osquery-rs-sdk = { version = "0.1", features = ["mock"] }
+//! osquery-rs-sdk = { version = "0.2", features = ["mock"] }
 //! ```
 //!
 //! # `MockExtensionManager`
@@ -19,45 +19,28 @@
 //! // ExtensionManagerServer::builder("ext", socket).client(Box::new(mock)).build()
 //! ```
 
-use crate::{client::ExtensionManager, osquery};
+use crate::client::{ExtensionManager, sealed};
+use crate::{ExtensionInfo, ExtensionRegistry, ExtensionUuid, OptionInfo};
+use crate::{PluginRequest, PluginResponse, Result};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use thrift::Result as TResult;
-
-// ---------------------------------------------------------------------------
-// Type aliases for mock function fields
-// ---------------------------------------------------------------------------
 
 type CloseFn = Box<dyn FnMut() + Send>;
 
-type PingFn = Box<dyn FnMut() -> TResult<osquery::ExtensionStatus> + Send>;
+type PingFn = Box<dyn FnMut() -> Result<()> + Send>;
 
-type CallFn = Box<
-    dyn FnMut(&str, &str, osquery::ExtensionPluginRequest) -> TResult<osquery::ExtensionResponse>
-        + Send,
->;
+type CallFn = Box<dyn FnMut(&str, &str, PluginRequest) -> Result<PluginResponse> + Send>;
 
-type ShutdownMockFn = Box<dyn FnMut() -> TResult<()> + Send>;
+type ExtensionsFn = Box<dyn FnMut() -> Result<Vec<ExtensionInfo>> + Send>;
 
-type ExtensionsFn = Box<dyn FnMut() -> TResult<osquery::InternalExtensionList> + Send>;
+type OptionsFn = Box<dyn FnMut() -> Result<BTreeMap<String, OptionInfo>> + Send>;
 
-type OptionsFn = Box<dyn FnMut() -> TResult<osquery::InternalOptionList> + Send>;
+type RegisterExtensionFn =
+    Box<dyn FnMut(&str, Option<&str>, ExtensionRegistry) -> Result<ExtensionUuid> + Send>;
 
-type RegisterExtensionFn = Box<
-    dyn FnMut(
-            osquery::InternalExtensionInfo,
-            osquery::ExtensionRegistry,
-        ) -> TResult<osquery::ExtensionStatus>
-        + Send,
->;
+type DeregisterExtensionFn = Box<dyn FnMut(ExtensionUuid) -> Result<()> + Send>;
 
-type DeregisterExtensionFn =
-    Box<dyn FnMut(osquery::ExtensionRouteUUID) -> TResult<osquery::ExtensionStatus> + Send>;
-
-type QueryFn = Box<dyn FnMut(&str) -> TResult<osquery::ExtensionResponse> + Send>;
-
-// ---------------------------------------------------------------------------
-// MockExtensionManager
-// ---------------------------------------------------------------------------
+type QueryFn = Box<dyn FnMut(&str) -> Result<PluginResponse> + Send>;
 
 /// A mock implementation of [`ExtensionManager`] for testing.
 ///
@@ -65,55 +48,51 @@ type QueryFn = Box<dyn FnMut(&str) -> TResult<osquery::ExtensionResponse> + Send
 /// override the default behavior, and a `*_call_count` counter that tracks
 /// how many times the method was called.
 ///
-/// By default, methods return success with reasonable values (status code 0,
-/// empty responses). Set a `*_fn` field to inject custom behavior.
+/// By default, methods return success with reasonable values (empty
+/// responses, registration uuid 1). Set a `*_fn` field to inject custom
+/// behavior.
 pub struct MockExtensionManager {
     /// Override for [`ExtensionManager::close`]. Default: no-op.
     pub close_fn: Option<CloseFn>,
     /// Number of times `close` was called.
     pub close_call_count: AtomicUsize,
 
-    /// Override for [`ExtensionManager::ping`]. Default: returns OK status.
+    /// Override for [`ExtensionManager::ping`]. Default: returns `Ok(())`.
     pub ping_fn: Option<PingFn>,
     /// Number of times `ping` was called.
     pub ping_call_count: AtomicUsize,
 
-    /// Override for [`ExtensionManager::call`]. Default: returns OK with empty response.
+    /// Override for [`ExtensionManager::call`]. Default: returns empty rows.
     pub call_fn: Option<CallFn>,
     /// Number of times `call` was called.
     pub call_call_count: AtomicUsize,
-
-    /// Override for [`ExtensionManager::shutdown`]. Default: returns Ok(()).
-    pub shutdown_fn: Option<ShutdownMockFn>,
-    /// Number of times `shutdown` was called.
-    pub shutdown_call_count: AtomicUsize,
 
     /// Override for [`ExtensionManager::extensions`]. Default: returns empty list.
     pub extensions_fn: Option<ExtensionsFn>,
     /// Number of times `extensions` was called.
     pub extensions_call_count: AtomicUsize,
 
-    /// Override for [`ExtensionManager::options`]. Default: returns empty list.
+    /// Override for [`ExtensionManager::options`]. Default: returns empty map.
     pub options_fn: Option<OptionsFn>,
     /// Number of times `options` was called.
     pub options_call_count: AtomicUsize,
 
-    /// Override for [`ExtensionManager::register_extension`]. Default: returns OK status with UUID 1.
+    /// Override for [`ExtensionManager::register_extension`]. Default: returns uuid 1.
     pub register_extension_fn: Option<RegisterExtensionFn>,
     /// Number of times `register_extension` was called.
     pub register_extension_call_count: AtomicUsize,
 
-    /// Override for [`ExtensionManager::deregister_extension`]. Default: returns OK status.
+    /// Override for [`ExtensionManager::deregister_extension`]. Default: returns `Ok(())`.
     pub deregister_extension_fn: Option<DeregisterExtensionFn>,
     /// Number of times `deregister_extension` was called.
     pub deregister_extension_call_count: AtomicUsize,
 
-    /// Override for [`ExtensionManager::query`]. Default: returns OK with empty response.
+    /// Override for [`ExtensionManager::query`]. Default: returns empty rows.
     pub query_fn: Option<QueryFn>,
     /// Number of times `query` was called.
     pub query_call_count: AtomicUsize,
 
-    /// Override for [`ExtensionManager::get_query_columns`]. Default: returns OK with empty response.
+    /// Override for [`ExtensionManager::get_query_columns`]. Default: returns empty rows.
     pub get_query_columns_fn: Option<QueryFn>,
     /// Number of times `get_query_columns` was called.
     pub get_query_columns_call_count: AtomicUsize,
@@ -130,8 +109,6 @@ impl MockExtensionManager {
             ping_call_count: AtomicUsize::new(0),
             call_fn: None,
             call_call_count: AtomicUsize::new(0),
-            shutdown_fn: None,
-            shutdown_call_count: AtomicUsize::new(0),
             extensions_fn: None,
             extensions_call_count: AtomicUsize::new(0),
             options_fn: None,
@@ -163,12 +140,6 @@ impl MockExtensionManager {
     #[must_use]
     pub fn call_invoked(&self) -> bool {
         self.call_call_count.load(Ordering::Relaxed) > 0
-    }
-
-    /// Return whether `shutdown` was called at least once.
-    #[must_use]
-    pub fn shutdown_invoked(&self) -> bool {
-        self.shutdown_call_count.load(Ordering::Relaxed) > 0
     }
 
     /// Return whether `extensions` was called at least once.
@@ -214,7 +185,6 @@ impl std::fmt::Debug for MockExtensionManager {
             .field("close_call_count", &self.close_call_count)
             .field("ping_call_count", &self.ping_call_count)
             .field("call_call_count", &self.call_call_count)
-            .field("shutdown_call_count", &self.shutdown_call_count)
             .field("extensions_call_count", &self.extensions_call_count)
             .field("options_call_count", &self.options_call_count)
             .field(
@@ -240,15 +210,7 @@ impl Default for MockExtensionManager {
     }
 }
 
-/// Returns a default OK [`osquery::ExtensionStatus`].
-fn ok_status() -> osquery::ExtensionStatus {
-    osquery::ExtensionStatus::new(0, "OK".to_string(), None)
-}
-
-/// Returns a default OK [`osquery::ExtensionResponse`] with empty response.
-fn ok_response() -> osquery::ExtensionResponse {
-    osquery::ExtensionResponse::new(ok_status(), None)
-}
+impl sealed::Sealed for MockExtensionManager {}
 
 impl ExtensionManager for MockExtensionManager {
     fn close(&mut self) {
@@ -258,11 +220,11 @@ impl ExtensionManager for MockExtensionManager {
         }
     }
 
-    fn ping(&mut self) -> TResult<osquery::ExtensionStatus> {
+    fn ping(&mut self) -> Result<()> {
         self.ping_call_count.fetch_add(1, Ordering::Relaxed);
         match &mut self.ping_fn {
             Some(f) => f(),
-            None => Ok(ok_status()),
+            None => Ok(()),
         }
     }
 
@@ -270,85 +232,71 @@ impl ExtensionManager for MockExtensionManager {
         &mut self,
         registry: &str,
         item: &str,
-        request: osquery::ExtensionPluginRequest,
-    ) -> TResult<osquery::ExtensionResponse> {
+        request: PluginRequest,
+    ) -> Result<PluginResponse> {
         self.call_call_count.fetch_add(1, Ordering::Relaxed);
         match &mut self.call_fn {
             Some(f) => f(registry, item, request),
-            None => Ok(ok_response()),
+            None => Ok(PluginResponse::new()),
         }
     }
 
-    fn shutdown(&mut self) -> TResult<()> {
-        self.shutdown_call_count.fetch_add(1, Ordering::Relaxed);
-        match &mut self.shutdown_fn {
-            Some(f) => f(),
-            None => Ok(()),
-        }
-    }
-
-    fn extensions(&mut self) -> TResult<osquery::InternalExtensionList> {
+    fn extensions(&mut self) -> Result<Vec<ExtensionInfo>> {
         self.extensions_call_count.fetch_add(1, Ordering::Relaxed);
         match &mut self.extensions_fn {
             Some(f) => f(),
-            None => Ok(osquery::InternalExtensionList::new()),
+            None => Ok(Vec::new()),
         }
     }
 
-    fn options(&mut self) -> TResult<osquery::InternalOptionList> {
+    fn options(&mut self) -> Result<BTreeMap<String, OptionInfo>> {
         self.options_call_count.fetch_add(1, Ordering::Relaxed);
         match &mut self.options_fn {
             Some(f) => f(),
-            None => Ok(osquery::InternalOptionList::new()),
+            None => Ok(BTreeMap::new()),
         }
     }
 
     fn register_extension(
         &mut self,
-        info: osquery::InternalExtensionInfo,
-        registry: osquery::ExtensionRegistry,
-    ) -> TResult<osquery::ExtensionStatus> {
+        name: &str,
+        version: Option<&str>,
+        registry: ExtensionRegistry,
+    ) -> Result<ExtensionUuid> {
         self.register_extension_call_count
             .fetch_add(1, Ordering::Relaxed);
         match &mut self.register_extension_fn {
-            Some(f) => f(info, registry),
-            None => Ok(osquery::ExtensionStatus::new(0, "OK".to_string(), Some(1))),
+            Some(f) => f(name, version, registry),
+            None => Ok(1),
         }
     }
 
-    fn deregister_extension(
-        &mut self,
-        uuid: osquery::ExtensionRouteUUID,
-    ) -> TResult<osquery::ExtensionStatus> {
+    fn deregister_extension(&mut self, uuid: ExtensionUuid) -> Result<()> {
         self.deregister_extension_call_count
             .fetch_add(1, Ordering::Relaxed);
         match &mut self.deregister_extension_fn {
             Some(f) => f(uuid),
-            None => Ok(ok_status()),
+            None => Ok(()),
         }
     }
 
-    fn query(&mut self, sql: &str) -> TResult<osquery::ExtensionResponse> {
+    fn query(&mut self, sql: &str) -> Result<PluginResponse> {
         self.query_call_count.fetch_add(1, Ordering::Relaxed);
         match &mut self.query_fn {
             Some(f) => f(sql),
-            None => Ok(ok_response()),
+            None => Ok(PluginResponse::new()),
         }
     }
 
-    fn get_query_columns(&mut self, sql: &str) -> TResult<osquery::ExtensionResponse> {
+    fn get_query_columns(&mut self, sql: &str) -> Result<PluginResponse> {
         self.get_query_columns_call_count
             .fetch_add(1, Ordering::Relaxed);
         match &mut self.get_query_columns_fn {
             Some(f) => f(sql),
-            None => Ok(ok_response()),
+            None => Ok(PluginResponse::new()),
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// MockPlugin
-// ---------------------------------------------------------------------------
 
 #[cfg(feature = "server")]
 use crate::{OsqueryPlugin, RegistryName};
@@ -357,26 +305,24 @@ use crate::{OsqueryPlugin, RegistryName};
 ///
 /// Each method has a corresponding `*_fn` field for overriding default behavior
 /// and a `*_call_count` counter that tracks invocations.
-/// By default, `call` returns an empty response with status code 0.
+/// By default, `call` returns empty rows.
 #[cfg(feature = "server")]
 pub struct MockPlugin {
     name: String,
     registry_name: RegistryName,
 
-    /// Override for [`OsqueryPlugin::call`]. Default: returns OK with empty response.
-    pub call_fn: Option<
-        Box<dyn FnMut(osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse + Send + Sync>,
-    >,
+    /// Override for [`OsqueryPlugin::call`]. Default: returns empty rows.
+    pub call_fn: Option<Box<dyn FnMut(PluginRequest) -> Result<PluginResponse> + Send + Sync>>,
     /// Number of times `call` was called.
     pub call_call_count: AtomicUsize,
 
     /// Override for [`OsqueryPlugin::routes`]. Default: returns empty response.
-    pub routes_fn: Option<Box<dyn Fn() -> osquery::ExtensionPluginResponse + Send + Sync>>,
+    pub routes_fn: Option<Box<dyn Fn() -> PluginResponse + Send + Sync>>,
     /// Number of times `routes` was called.
     pub routes_call_count: AtomicUsize,
 
-    /// Override for [`OsqueryPlugin::ping`]. Default: returns OK status.
-    pub ping_fn: Option<Box<dyn Fn() -> osquery::ExtensionStatus + Send + Sync>>,
+    /// Override for [`OsqueryPlugin::ping`]. Default: returns `Ok(())`.
+    pub ping_fn: Option<Box<dyn Fn() -> Result<()> + Send + Sync>>,
     /// Number of times `ping` was called.
     pub ping_call_count: AtomicUsize,
 
@@ -454,27 +400,27 @@ impl OsqueryPlugin for MockPlugin {
         self.registry_name
     }
 
-    fn routes(&self) -> osquery::ExtensionPluginResponse {
+    fn routes(&self) -> PluginResponse {
         self.routes_call_count.fetch_add(1, Ordering::Relaxed);
         match &self.routes_fn {
             Some(f) => f(),
-            None => osquery::ExtensionPluginResponse::new(),
+            None => PluginResponse::new(),
         }
     }
 
-    fn ping(&self) -> osquery::ExtensionStatus {
+    fn ping(&self) -> Result<()> {
         self.ping_call_count.fetch_add(1, Ordering::Relaxed);
         match &self.ping_fn {
             Some(f) => f(),
-            None => osquery::ExtensionStatus::new(0, "OK".to_string(), None),
+            None => Ok(()),
         }
     }
 
-    fn call(&mut self, req: osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse {
+    fn call(&mut self, req: PluginRequest) -> Result<PluginResponse> {
         self.call_call_count.fetch_add(1, Ordering::Relaxed);
         match &mut self.call_fn {
             Some(f) => f(req),
-            None => ok_response(),
+            None => Ok(PluginResponse::new()),
         }
     }
 
@@ -485,10 +431,6 @@ impl OsqueryPlugin for MockPlugin {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -503,27 +445,20 @@ mod tests {
         assert!(!mock.call_invoked());
         assert!(!mock.close_invoked());
 
-        // Ping returns OK by default
-        let status = mock.ping().unwrap();
-        assert_eq!(status.code.unwrap(), 0);
+        // Ping succeeds by default
+        mock.ping().unwrap();
         assert!(mock.ping_invoked());
 
-        // Call returns OK by default
-        let resp = mock
-            .call("table", "test", osquery::ExtensionPluginRequest::new())
-            .unwrap();
-        assert_eq!(resp.status.unwrap().code.unwrap(), 0);
+        // Call returns empty rows by default
+        let rows = mock.call("table", "test", PluginRequest::new()).unwrap();
+        assert!(rows.is_empty());
         assert!(mock.call_invoked());
 
-        // Register returns OK with UUID 1
-        let status = mock
-            .register_extension(
-                osquery::InternalExtensionInfo::new("test".to_string(), None, None, None),
-                osquery::ExtensionRegistry::new(),
-            )
+        // Register returns uuid 1
+        let uuid = mock
+            .register_extension("test", None, ExtensionRegistry::new())
             .unwrap();
-        assert_eq!(status.code.unwrap(), 0);
-        assert_eq!(status.uuid.unwrap(), 1);
+        assert_eq!(uuid, 1);
         assert!(mock.register_extension_invoked());
     }
 
@@ -531,16 +466,17 @@ mod tests {
     fn mock_extension_manager_custom_fns() {
         let mut mock = MockExtensionManager::new();
         mock.ping_fn = Some(Box::new(|| {
-            Ok(osquery::ExtensionStatus::new(
-                1,
-                "custom error".to_string(),
-                None,
-            ))
+            Err(crate::Error::Status {
+                code: 1,
+                message: "custom error".to_string(),
+            })
         }));
 
-        let status = mock.ping().unwrap();
-        assert_eq!(status.code.unwrap(), 1);
-        assert_eq!(status.message.unwrap(), "custom error");
+        let err = mock.ping().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Status { code: 1, .. }),
+            "should surface the injected status error"
+        );
         assert!(mock.ping_invoked());
     }
 
@@ -549,18 +485,15 @@ mod tests {
         let mut mock = MockExtensionManager::new();
         mock.query_fn = Some(Box::new(|sql| {
             assert_eq!(sql, "SELECT 1");
-            Ok(osquery::ExtensionResponse::new(
-                osquery::ExtensionStatus::new(0, "OK".to_string(), None),
-                Some(vec![std::collections::BTreeMap::from([(
-                    "1".to_string(),
-                    "1".to_string(),
-                )])]),
-            ))
+            Ok(vec![std::collections::BTreeMap::from([(
+                "1".to_string(),
+                "1".to_string(),
+            )])])
         }));
 
-        let resp = mock.query("SELECT 1").unwrap();
+        let rows = mock.query("SELECT 1").unwrap();
         assert!(mock.query_invoked());
-        assert_eq!(resp.response.unwrap().len(), 1);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
@@ -583,9 +516,9 @@ mod tests {
             assert_eq!(plugin.name(), "test_table");
             assert_eq!(plugin.registry_name(), RegistryName::Table);
 
-            // Call returns OK by default
-            let resp = plugin.call(osquery::ExtensionPluginRequest::new());
-            assert_eq!(resp.status.unwrap().code.unwrap(), 0);
+            // Call returns empty rows by default
+            let rows = plugin.call(PluginRequest::new()).unwrap();
+            assert!(rows.is_empty());
             assert!(plugin.call_invoked());
         }
 
@@ -593,14 +526,14 @@ mod tests {
         fn mock_plugin_custom_call() {
             let mut plugin = MockPlugin::new("test_table", RegistryName::Table);
             plugin.call_fn = Some(Box::new(|_req| {
-                osquery::ExtensionResponse::new(
-                    osquery::ExtensionStatus::new(42, "custom".to_string(), None),
-                    None,
-                )
+                Err(crate::Error::Status {
+                    code: 42,
+                    message: "custom".to_string(),
+                })
             }));
 
-            let resp = plugin.call(osquery::ExtensionPluginRequest::new());
-            assert_eq!(resp.status.unwrap().code.unwrap(), 42);
+            let err = plugin.call(PluginRequest::new()).unwrap_err();
+            assert!(matches!(err, crate::Error::Status { code: 42, .. }));
             assert!(plugin.call_invoked());
         }
     }

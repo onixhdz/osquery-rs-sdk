@@ -33,11 +33,18 @@ use osquery_rs_sdk::{
 
 /// Set up a server with a trivial table plugin and return:
 /// - the `JoinHandle` for the server thread (which runs `server.run()`)
+/// - a [`ShutdownHandle`] to stop it
 /// - the listen socket path to connect a client to
 ///
 /// The server runs on a unique UDS path derived from `tag` to avoid
 /// interference between benchmarks.
-fn start_server(tag: &str) -> (std::thread::JoinHandle<()>, String) {
+fn start_server(
+    tag: &str,
+) -> (
+    std::thread::JoinHandle<()>,
+    osquery_rs_sdk::ShutdownHandle,
+    String,
+) {
     let socket = format!("/tmp/osquery_bench_{tag}.em");
     // Mock returns uuid=1, so the extension server listens on socket_path.1
     let listen_socket = format!("{socket}.1");
@@ -61,6 +68,7 @@ fn start_server(tag: &str) -> (std::thread::JoinHandle<()>, String) {
         .register_plugin(table)
         .expect("register_plugin should succeed");
 
+    let shutdown = server.shutdown_handle();
     let handle = std::thread::spawn(move || {
         // run() blocks until shutdown is requested
         let _ = server.run();
@@ -78,7 +86,7 @@ fn start_server(tag: &str) -> (std::thread::JoinHandle<()>, String) {
         "server did not create listen socket at {listen_socket}"
     );
 
-    (handle, listen_socket)
+    (handle, shutdown, listen_socket)
 }
 
 /// Benchmark: thrift ping round-trip through UDS.
@@ -87,7 +95,7 @@ fn start_server(tag: &str) -> (std::thread::JoinHandle<()>, String) {
 /// handler dispatch (ping handler) → server thrift encode → UDS → client
 /// thrift decode.
 fn bench_ping_roundtrip(c: &mut Criterion) {
-    let (handle, listen_socket) = start_server("ping_rt");
+    let (handle, shutdown, listen_socket) = start_server("ping_rt");
     let mut client = ExtensionManagerClient::connect_with_path(&listen_socket)
         .expect("client should connect to bench server");
 
@@ -101,13 +109,13 @@ fn bench_ping_roundtrip(c: &mut Criterion) {
     });
 
     // Clean shutdown
-    client.shutdown().ok();
+    shutdown.shutdown();
     handle.join().ok();
 }
 
 /// Benchmark: sustained ping throughput (batch of N pings per iteration).
 fn bench_ping_throughput(c: &mut Criterion) {
-    let (handle, listen_socket) = start_server("ping_tp");
+    let (handle, shutdown, listen_socket) = start_server("ping_tp");
     let mut client = ExtensionManagerClient::connect_with_path(&listen_socket)
         .expect("client should connect to bench server");
 
@@ -124,7 +132,7 @@ fn bench_ping_throughput(c: &mut Criterion) {
     });
     group.finish();
 
-    client.shutdown().ok();
+    shutdown.shutdown();
     handle.join().ok();
 }
 
@@ -133,7 +141,7 @@ fn bench_ping_throughput(c: &mut Criterion) {
 /// Each iteration spawns `n_clients` threads, each performing 100 pings.
 /// Measures aggregate throughput and contention characteristics.
 fn bench_concurrent_ping(c: &mut Criterion) {
-    let (handle, listen_socket) = start_server("conc_ping");
+    let (handle, shutdown, listen_socket) = start_server("conc_ping");
 
     // Verify connectivity
     {
@@ -183,9 +191,7 @@ fn bench_concurrent_ping(c: &mut Criterion) {
     group.finish();
 
     // Shutdown
-    let mut client = ExtensionManagerClient::connect_with_path(&listen_socket)
-        .expect("shutdown client should connect");
-    client.shutdown().ok();
+    shutdown.shutdown();
     handle.join().ok();
 }
 

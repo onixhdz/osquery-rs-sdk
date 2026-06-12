@@ -324,8 +324,8 @@ impl ExtensionManagerServer {
         Ok(())
     }
 
-    fn gen_registry(&mut self) -> Result<osquery::ExtensionRegistry> {
-        let mut ext_registry = osquery::ExtensionRegistry::new();
+    fn gen_registry(&mut self) -> Result<crate::ExtensionRegistry> {
+        let mut ext_registry = crate::ExtensionRegistry::new();
         let registry = self.registry.lock().map_err(|_| "registry lock poisoned")?;
 
         for (reg_name, plugins) in registry.iter() {
@@ -346,34 +346,16 @@ impl ExtensionManagerServer {
     /// Returns the `ExtensionRouteUUID`.
     fn register_extension(&mut self) -> Result<i64> {
         let registry = self.gen_registry()?;
-        let response = self
+        let uuid = self
             .osquery_client
             .lock()
             .map_err(|_| "osquery client lock poisoned")?
             .as_mut()
             .ok_or("cannot start, shutdown in progress")?
-            .register_extension(
-                osquery::InternalExtensionInfo::new(
-                    self.name.clone(),
-                    self.version.clone(),
-                    None,
-                    None,
-                ),
-                registry,
-            )?;
+            .register_extension(&self.name, self.version.as_deref(), registry)
+            .map_err(|e| e.context("registering extension"))?;
 
-        let code = response.code.unwrap_or_default();
-        if code != 0 {
-            return Err(format!(
-                "status {} registering extension: {}",
-                code,
-                response.message.unwrap_or_default()
-            )
-            .into());
-        }
-
-        self.uuid = response.uuid;
-        let uuid = self.uuid.ok_or("uuid returned nil")?;
+        self.uuid = Some(uuid);
 
         // osquery expects the extension to listen on `<socket_path>.<uuid>`.
         let mut listen_path = self.socket_path.clone().into_os_string();
@@ -455,22 +437,11 @@ impl ExtensionManagerServer {
         match self.try_lock_client(CLIENT_LOCK_DEADLINE) {
             Some(mut client_guard) => {
                 if let Some(client) = client_guard.as_mut() {
-                    match client.deregister_extension(uuid) {
-                        Err(err) => {
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!("error deregistering extension {}: {}", uuid, err);
-                            #[cfg(not(feature = "tracing"))]
-                            let _ = err;
-                        }
-                        Ok(res) if res.code.unwrap_or_default() != 0 => {
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!(
-                                "status {} deregistering extension: {}",
-                                res.code.unwrap_or_default(),
-                                res.message.as_deref().unwrap_or_default()
-                            );
-                        }
-                        Ok(_) => {}
+                    if let Err(err) = client.deregister_extension(uuid) {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!("error deregistering extension {}: {}", uuid, err);
+                        #[cfg(not(feature = "tracing"))]
+                        let _ = err;
                     }
                 }
             }
@@ -570,21 +541,9 @@ impl ExtensionManagerServer {
                 let Some(client) = guard.as_mut() else {
                     break 'watch;
                 };
-                match client.ping() {
-                    Err(e) => {
-                        tx.send(Some(Error::from(e).context("extension ping failed")))
-                            .ok();
-                        break 'watch;
-                    }
-                    Ok(status) if status.code.unwrap_or_default() != 0 => {
-                        tx.send(Some(Error::from(format!(
-                            "ping returned status {}",
-                            status.code.unwrap_or_default()
-                        ))))
-                        .ok();
-                        break 'watch;
-                    }
-                    Ok(_) => {}
+                if let Err(e) = client.ping() {
+                    tx.send(Some(e.context("extension ping failed"))).ok();
+                    break 'watch;
                 }
             }
             ping_done_tx.send(()).ok();
@@ -664,6 +623,26 @@ impl Drop for ExtensionManagerServer {
     }
 }
 
+/// Convert a plugin result to the osquery wire format. `Ok(rows)` becomes a
+/// success response, [`Error::Status`] keeps its code and message, and any
+/// other error becomes status 1 with the error's message.
+fn plugin_response_to_wire(result: Result<crate::PluginResponse>) -> osquery::ExtensionResponse {
+    match result {
+        Ok(rows) => osquery::ExtensionResponse::new(
+            osquery::ExtensionStatus::new(0, "OK".to_string(), None),
+            rows,
+        ),
+        Err(Error::Status { code, message }) => osquery::ExtensionResponse::new(
+            osquery::ExtensionStatus::new(code, message, None),
+            None,
+        ),
+        Err(err) => osquery::ExtensionResponse::new(
+            osquery::ExtensionStatus::new(1, err.to_string(), None),
+            None,
+        ),
+    }
+}
+
 /// Thrift request handler for the extension server.
 struct ExtensionServerHandler {
     registry: Registry,
@@ -711,7 +690,7 @@ impl osquery::ExtensionSyncHandler for ExtensionServerHandler {
         match lookup_result {
             Ok(plugin) => {
                 let mut plugin = plugin.lock().map_err(|_| "plugin lock poisoned")?;
-                Ok(plugin.call(request))
+                Ok(plugin_response_to_wire(plugin.call(request)))
             }
             Err(msg) => {
                 #[cfg(feature = "tracing")]
@@ -767,7 +746,6 @@ mod tests {
     use crate::osquery::ExtensionSyncHandler;
     use crate::plugin::table::{ColumnDefinition, TablePlugin};
     use crate::server::RegistryName;
-    use crate::server::mock;
     use serial_test::serial;
 
     #[cfg(unix)]
@@ -804,12 +782,13 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mock")]
     #[test]
     #[ignore = "requires a running osqueryd extension socket"]
     #[serial]
     fn register_plugin() {
         let name = "test_plugin";
-        let plugin = mock::MockPlugin::new(name, RegistryName::Table);
+        let plugin = crate::mock::MockPlugin::new(name, RegistryName::Table);
         let mut server = init_server();
 
         server.register_plugin(plugin).unwrap();
@@ -823,12 +802,13 @@ mod tests {
             .get(name);
     }
 
+    #[cfg(feature = "mock")]
     #[test]
     #[ignore = "requires a running osqueryd extension socket"]
     #[serial]
     fn gen_registry() {
         let name = "test_plugin";
-        let plugin = mock::MockPlugin::new(name, RegistryName::Table);
+        let plugin = crate::mock::MockPlugin::new(name, RegistryName::Table);
         let mut server = init_server();
 
         server.register_plugin(plugin).unwrap();
@@ -922,8 +902,10 @@ mod tests {
         assert!(rx.recv().unwrap().is_none(), "shutdown should not fail");
     }
 
+    #[cfg(feature = "mock")]
     #[test]
     fn handle_call() {
+        const MOCK_STATUS_CODE: i32 = 9999;
         let (tx, _) = std::sync::mpsc::sync_channel(1);
         let reg: Registry = Arc::from(Mutex::new(HashMap::new()));
         let handler = ExtensionServerHandler {
@@ -944,7 +926,13 @@ mod tests {
             "status code should be 1 if table not found"
         );
         let name = "test_plugin";
-        let plugin = mock::MockPlugin::new(name, RegistryName::Table);
+        let mut plugin = crate::mock::MockPlugin::new(name, RegistryName::Table);
+        plugin.call_fn = Some(Box::new(|_req| {
+            Err(Error::Status {
+                code: MOCK_STATUS_CODE,
+                message: "mock".to_string(),
+            })
+        }));
         let plugin_name = plugin.name().to_string();
 
         reg.lock()
@@ -964,8 +952,8 @@ mod tests {
 
         assert_eq!(
             res.status.unwrap().code.unwrap(),
-            mock::STATUS_CODE,
-            "status code should be 1 if table not found"
+            MOCK_STATUS_CODE,
+            "registered plugin should answer with its mock status"
         );
 
         let res = handler
@@ -1031,15 +1019,25 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mock")]
     #[test]
     #[ignore = "requires a running osqueryd extension socket"]
     #[serial]
     fn register_plugins_batch() {
         let mut server = init_server();
         let plugins: Vec<Box<dyn OsqueryPlugin>> = vec![
-            Box::new(mock::MockPlugin::new("plugin_a", RegistryName::Table)),
-            Box::new(mock::MockPlugin::new("plugin_b", RegistryName::Logger)),
-            Box::new(mock::MockPlugin::new("plugin_c", RegistryName::Config)),
+            Box::new(crate::mock::MockPlugin::new(
+                "plugin_a",
+                RegistryName::Table,
+            )),
+            Box::new(crate::mock::MockPlugin::new(
+                "plugin_b",
+                RegistryName::Logger,
+            )),
+            Box::new(crate::mock::MockPlugin::new(
+                "plugin_c",
+                RegistryName::Config,
+            )),
         ];
         server.register_plugins(plugins).unwrap();
 
@@ -1188,7 +1186,7 @@ mod tests {
         mock.ping_fn = Some(Box::new(move || {
             ping_started_tx.send(()).ok();
             release_rx.recv().ok(); // Park, simulating a hung osquery socket.
-            Ok(osquery::ExtensionStatus::new(0, "OK".to_string(), None))
+            Ok(())
         }));
 
         let (mut server, listen_path) = init_mock_server("wedged_ping", mock);
@@ -1223,7 +1221,7 @@ mod tests {
         let mut mock = crate::mock::MockExtensionManager::new();
         mock.ping_fn = Some(Box::new(move || {
             pings_in_fn.fetch_add(1, Ordering::SeqCst);
-            Ok(osquery::ExtensionStatus::new(0, "OK".to_string(), None))
+            Ok(())
         }));
 
         let (mut server, listen_path) = init_mock_server("ping_thread_stop", mock);

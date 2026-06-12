@@ -33,9 +33,7 @@ fn osquery_socket() -> String {
     std::env::var("OSQUERY_SOCKET").unwrap_or_else(|_| DEFAULT_OSQUERY_SOCKET.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// 1. Client: connect, query, query_rows, query_row
-// ---------------------------------------------------------------------------
+// 1. Client: connect, query, query_row
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
@@ -49,30 +47,26 @@ fn client_connect_and_query() {
     .expect("should connect to osqueryd");
 
     // ping
-    let status = client.ping().expect("ping should succeed");
-    assert_eq!(status.code.unwrap_or(-1), 0, "ping status should be OK");
+    client.ping().expect("ping should succeed");
 
-    // raw query
-    let resp = client
+    // query
+    let rows = client
         .query("SELECT 1 AS value")
         .expect("query should succeed");
-    let status = resp.status.expect("response should have status");
-    assert_eq!(status.code.unwrap_or(-1), 0, "query status should be OK");
-    let rows = resp.response.expect("response should have rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("value").map(String::as_str), Some("1"));
 }
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
-fn client_query_rows_and_query_row() {
+fn client_query_and_query_row() {
     let mut client =
         ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
 
-    // query_rows
+    // query
     let rows = client
-        .query_rows("SELECT 1 AS a, 2 AS b")
-        .expect("query_rows should succeed");
+        .query("SELECT 1 AS a, 2 AS b")
+        .expect("query should succeed");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("a").map(String::as_str), Some("1"));
     assert_eq!(rows[0].get("b").map(String::as_str), Some("2"));
@@ -106,9 +100,7 @@ fn client_close_then_ping_fails() {
     assert!(client.ping().is_err(), "ping after close should fail");
 }
 
-// ---------------------------------------------------------------------------
 // 2. Server + TablePlugin: register, run, query via osqueryd, verify data
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
@@ -148,7 +140,7 @@ fn table_plugin_e2e() {
         ExtensionManagerClient::connect_with_path(osquery_socket()).expect("client should connect");
 
     let rows = client
-        .query_rows("SELECT * FROM e2e_table")
+        .query("SELECT * FROM e2e_table")
         .expect("query on e2e_table should succeed");
 
     assert_eq!(rows.len(), 2, "should return 2 rows");
@@ -159,7 +151,7 @@ fn table_plugin_e2e() {
 
     // Query with a WHERE clause
     let rows = client
-        .query_rows("SELECT greeting FROM e2e_table WHERE count = '2'")
+        .query("SELECT greeting FROM e2e_table WHERE count = '2'")
         .expect("filtered query should succeed");
     assert_eq!(rows.len(), 1, "WHERE clause should filter to 1 row");
     assert_eq!(rows[0].get("greeting").map(String::as_str), Some("world"));
@@ -168,9 +160,7 @@ fn table_plugin_e2e() {
     drop(handle);
 }
 
-// ---------------------------------------------------------------------------
 // 2b. Writable TablePlugin: INSERT, SELECT, UPDATE, DELETE via osqueryd
-// ---------------------------------------------------------------------------
 
 struct E2eWritableTable {
     data: BTreeMap<i64, (String, String)>,
@@ -263,25 +253,18 @@ fn writable_table_plugin_e2e() {
 
     // 1. Table should start empty
     let rows = client
-        .query_rows("SELECT * FROM e2e_writable")
+        .query("SELECT * FROM e2e_writable")
         .expect("SELECT on empty writable table should succeed");
     assert_eq!(rows.len(), 0, "writable table should start empty");
 
     // 2. INSERT a row
-    let resp = client
+    client
         .query("INSERT INTO e2e_writable (key, value) VALUES ('greeting', 'hello')")
         .expect("INSERT should succeed");
-    let status = resp.status.expect("INSERT response should have status");
-    assert_eq!(
-        status.code.unwrap_or(-1),
-        0,
-        "INSERT status should be OK: {:?}",
-        status.message
-    );
 
     // 3. SELECT should return the inserted row
     let rows = client
-        .query_rows("SELECT key, value FROM e2e_writable")
+        .query("SELECT key, value FROM e2e_writable")
         .expect("SELECT after INSERT should succeed");
     assert_eq!(rows.len(), 1, "should have 1 row after INSERT");
     assert_eq!(
@@ -296,20 +279,13 @@ fn writable_table_plugin_e2e() {
     );
 
     // 4. UPDATE the row
-    let resp = client
+    client
         .query("UPDATE e2e_writable SET value = 'world' WHERE key = 'greeting'")
         .expect("UPDATE should succeed");
-    let status = resp.status.expect("UPDATE response should have status");
-    assert_eq!(
-        status.code.unwrap_or(-1),
-        0,
-        "UPDATE status should be OK: {:?}",
-        status.message
-    );
 
     // 5. Verify the update
     let rows = client
-        .query_rows("SELECT key, value FROM e2e_writable")
+        .query("SELECT key, value FROM e2e_writable")
         .expect("SELECT after UPDATE should succeed");
     assert_eq!(rows.len(), 1, "should still have 1 row after UPDATE");
     assert_eq!(
@@ -319,29 +295,20 @@ fn writable_table_plugin_e2e() {
     );
 
     // 6. DELETE the row
-    let resp = client
+    client
         .query("DELETE FROM e2e_writable WHERE key = 'greeting'")
         .expect("DELETE should succeed");
-    let status = resp.status.expect("DELETE response should have status");
-    assert_eq!(
-        status.code.unwrap_or(-1),
-        0,
-        "DELETE status should be OK: {:?}",
-        status.message
-    );
 
     // 7. Table should be empty again
     let rows = client
-        .query_rows("SELECT * FROM e2e_writable")
+        .query("SELECT * FROM e2e_writable")
         .expect("SELECT after DELETE should succeed");
     assert_eq!(rows.len(), 0, "table should be empty after DELETE");
 
     drop(handle);
 }
 
-// ---------------------------------------------------------------------------
 // 3. Server + ConfigPlugin: register and call via osqueryd
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
@@ -377,9 +344,7 @@ fn config_plugin_e2e() {
     );
 
     // Verify our extension is listed
-    let our_ext = extensions
-        .values()
-        .find(|info| info.name.as_deref() == Some("e2e_config_ext"));
+    let our_ext = extensions.iter().find(|info| info.name == "e2e_config_ext");
     assert!(
         our_ext.is_some(),
         "e2e_config_ext should be in the extensions list"
@@ -388,9 +353,7 @@ fn config_plugin_e2e() {
     drop(handle);
 }
 
-// ---------------------------------------------------------------------------
 // 4. Server + LoggerPlugin: register and verify
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
@@ -420,9 +383,7 @@ fn logger_plugin_e2e() {
         ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
     let extensions = client.extensions().expect("extensions should succeed");
 
-    let our_ext = extensions
-        .values()
-        .find(|info| info.name.as_deref() == Some("e2e_logger_ext"));
+    let our_ext = extensions.iter().find(|info| info.name == "e2e_logger_ext");
     assert!(
         our_ext.is_some(),
         "e2e_logger_ext should be in the extensions list"
@@ -431,9 +392,7 @@ fn logger_plugin_e2e() {
     drop(handle);
 }
 
-// ---------------------------------------------------------------------------
 // 5. Server + DistributedPlugin: register and verify
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
@@ -468,8 +427,8 @@ fn distributed_plugin_e2e() {
     let extensions = client.extensions().expect("extensions should succeed");
 
     let our_ext = extensions
-        .values()
-        .find(|info| info.name.as_deref() == Some("e2e_distributed_ext"));
+        .iter()
+        .find(|info| info.name == "e2e_distributed_ext");
     assert!(
         our_ext.is_some(),
         "e2e_distributed_ext should be in the extensions list"
@@ -478,9 +437,7 @@ fn distributed_plugin_e2e() {
     drop(handle);
 }
 
-// ---------------------------------------------------------------------------
 // 6. Server with multiple plugins via register_plugins
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
@@ -516,16 +473,14 @@ fn register_multiple_plugins_e2e() {
         ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
 
     let rows = client
-        .query_rows("SELECT * FROM e2e_multi_table")
+        .query("SELECT * FROM e2e_multi_table")
         .expect("should query multi table");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("col1").map(String::as_str), Some("val1"));
 
     // Verify both plugins are registered
     let extensions = client.extensions().expect("extensions should succeed");
-    let our_ext = extensions
-        .values()
-        .find(|info| info.name.as_deref() == Some("e2e_multi_ext"));
+    let our_ext = extensions.iter().find(|info| info.name == "e2e_multi_ext");
     assert!(
         our_ext.is_some(),
         "e2e_multi_ext should be in the extensions list"
@@ -534,9 +489,7 @@ fn register_multiple_plugins_e2e() {
     drop(handle);
 }
 
-// ---------------------------------------------------------------------------
 // 7. Builder pattern with custom options
-// ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
@@ -550,9 +503,7 @@ fn builder_pattern_e2e() {
         .expect("builder should succeed");
 }
 
-// ---------------------------------------------------------------------------
 // 8. MockExtensionManager: test without live osqueryd
-// ---------------------------------------------------------------------------
 
 #[cfg(feature = "mock")]
 #[test]
@@ -579,9 +530,7 @@ fn mock_server_with_mock_client() {
         .expect("shutdown without start should succeed");
 }
 
-// ---------------------------------------------------------------------------
 // 9. Error cases (no live osqueryd needed)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn socket_path_too_long() {

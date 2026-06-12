@@ -1,7 +1,7 @@
 //! Create an osquery logging plugin.
 //!
 //! See <https://osquery.readthedocs.io/en/latest/development/logger-plugins/> for more.
-use crate::{OsqueryPlugin, RegistryName, Result, osquery};
+use crate::{Error, OsqueryPlugin, PluginRequest, PluginResponse, RegistryName, Result};
 use serde_json::Value;
 use std::{fmt, str::FromStr, sync::Mutex};
 
@@ -73,6 +73,8 @@ impl<LogFunc: FnMut(LogType, &str) -> Result<()>> LoggerPlugin<LogFunc> {
     /// Create a new logger plugin.
     ///
     /// `log_fn` is called for each log entry with its [`LogType`] and message.
+    /// Callback errors from a request are aggregated into a single status 1
+    /// reply; per-error status codes are not preserved.
     pub fn new(name: &str, log_fn: LogFunc) -> Self {
         Self {
             name: name.to_string(),
@@ -116,7 +118,7 @@ impl<LogFunc: FnMut(LogType, &str) -> Result<()> + Send + Sync> OsqueryPlugin
         feature = "tracing",
         tracing::instrument(skip(self, req), fields(plugin = %self.name))
     )]
-    fn call(&mut self, req: osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse {
+    fn call(&mut self, req: PluginRequest) -> Result<PluginResponse> {
         let mut errors = Vec::new();
         for (typ, log) in &req {
             match LogType::from_str(typ) {
@@ -156,16 +158,10 @@ impl<LogFunc: FnMut(LogType, &str) -> Result<()> + Send + Sync> OsqueryPlugin
         }
 
         if !errors.is_empty() {
-            return osquery::ExtensionResponse::new(
-                osquery::ExtensionStatus::new(1, format!("error {}", errors.join(", ")), None),
-                None,
-            );
+            return Err(Error::Other(format!("error {}", errors.join(", "))));
         }
 
-        osquery::ExtensionResponse::new(
-            osquery::ExtensionStatus::new(0, String::from("OK"), None),
-            osquery::ExtensionPluginResponse::new(),
-        )
+        Ok(PluginResponse::new())
     }
 }
 
@@ -177,7 +173,6 @@ mod tests {
     fn logger_plugin() {
         let mut status_calls = 0;
         let mut last_status_log = String::new();
-        let status_ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
         let mut plugin = LoggerPlugin::new("mock", |typ, log| {
             match typ {
                 LogType::Health => {
@@ -208,16 +203,16 @@ mod tests {
         assert_eq!(plugin.name(), "mock");
         assert_eq!(plugin.registry_name(), RegistryName::Logger);
 
-        let res = plugin.call(osquery::ExtensionPluginRequest::from([
-            ("snapshot".to_string(), "logged snapshot".to_string()),
-            ("string".to_string(), "logged string".to_string()),
-            ("health".to_string(), "logged health".to_string()),
-            ("init".to_string(), "logged init".to_string()),
-            ("status".to_string(), "true".to_string()),
-            (String::from("log"), String::from(r#"{"":{"s":"0","f":"events.cpp","i":"828","m":"Event publisher failed setup: kernel: Cannot access \/dev\/osquery"},"":{"s":"0","f":"events.cpp","i":"828","m":"Event publisher failed setup: scnetwork: Publisher not used"},"":{"s":"0","f":"scheduler.cpp","i":"74","m":"Executing scheduled query macos_kextstat: SELECT * FROM time"}}"#)),
-        ]));
-
-        assert_eq!(res.status.unwrap(), status_ok);
+        plugin
+            .call(PluginRequest::from([
+                ("snapshot".to_string(), "logged snapshot".to_string()),
+                ("string".to_string(), "logged string".to_string()),
+                ("health".to_string(), "logged health".to_string()),
+                ("init".to_string(), "logged init".to_string()),
+                ("status".to_string(), "true".to_string()),
+                (String::from("log"), String::from(r#"{"":{"s":"0","f":"events.cpp","i":"828","m":"Event publisher failed setup: kernel: Cannot access \/dev\/osquery"},"":{"s":"0","f":"events.cpp","i":"828","m":"Event publisher failed setup: scnetwork: Publisher not used"},"":{"s":"0","f":"scheduler.cpp","i":"74","m":"Executing scheduled query macos_kextstat: SELECT * FROM time"}}"#)),
+            ]))
+            .unwrap();
         assert_eq!(last_status_log, r#"{"f":"scheduler.cpp","i":"74","m":"Executing scheduled query macos_kextstat: SELECT * FROM time","s":"0"}"#.to_string());
         assert_eq!(
             status_calls, 3,
@@ -233,67 +228,41 @@ mod tests {
             Err("log_fn_foobar".into())
         });
 
-        assert_eq!(
-            0,
-            plugin
-                .call(osquery::ExtensionPluginRequest::from([]))
-                .status
-                .unwrap()
-                .code
-                .unwrap()
-        );
+        plugin.call(PluginRequest::from([])).unwrap();
 
-        assert_eq!(
-            1,
-            plugin
-                .call(osquery::ExtensionPluginRequest::from([(
-                    "custom".to_string(),
-                    String::new()
-                )]))
-                .status
-                .unwrap()
-                .code
-                .unwrap()
-        );
+        plugin
+            .call(PluginRequest::from([("custom".to_string(), String::new())]))
+            .unwrap_err();
 
-        assert_eq!(
-            1,
-            plugin
-                .call(osquery::ExtensionPluginRequest::from([
-                    ("status".to_string(), "true".to_string()),
-                    ("log".to_string(), String::new())
-                ]))
-                .status
-                .unwrap()
-                .code
-                .unwrap()
-        );
+        plugin
+            .call(PluginRequest::from([
+                ("status".to_string(), "true".to_string()),
+                ("log".to_string(), String::new()),
+            ]))
+            .unwrap_err();
 
-        let res = plugin
-            .call(osquery::ExtensionPluginRequest::from([(
+        let err = plugin
+            .call(PluginRequest::from([(
                 "string".to_string(),
                 "logged true".to_string(),
             )]))
-            .status
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(1, res.code.unwrap());
         assert_eq!(
             "error log_fn_foobar for type: string".to_string(),
-            res.message.unwrap()
+            err.to_string()
         );
 
-        let res = plugin
-            .call(osquery::ExtensionPluginRequest::from([
+        let err = plugin
+            .call(PluginRequest::from([
                 ("string".to_string(), "logged true".to_string()),
                 ("init".to_string(), "logged true".to_string()),
                 ("unknown_type".to_string(), "logged true".to_string()),
             ]))
-            .status
-            .unwrap();
+            .unwrap_err();
 
         // BTreeMap iterates in sorted order: init, string, unknown_type
-        let msg = res.message.unwrap();
+        let msg = err.to_string();
         assert!(
             msg.contains("log_fn_foobar for type: init"),
             "should contain init error: {msg}"

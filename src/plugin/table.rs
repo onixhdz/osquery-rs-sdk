@@ -1,6 +1,6 @@
 //! Create an osquery table plugin.
 
-use crate::{OsqueryPlugin, RegistryName, Result, osquery};
+use crate::{OsqueryPlugin, PluginRequest, PluginResponse, RegistryName, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, result};
@@ -723,10 +723,10 @@ fn parse_json_value_array(json: &str) -> Result<ColumnValues> {
         .collect())
 }
 
-/// Build an [`ExtensionResponse`](osquery::ExtensionResponse) from a [`MutationResult`],
-/// mapping each variant to its osquery wire-format status string.
-fn mutation_response(result: MutationResult) -> osquery::ExtensionResponse {
-    let ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
+/// Build response rows from a [`MutationResult`], mapping each variant to
+/// its osquery wire-format status string. Mutation outcomes (including
+/// failures) travel as rows under a successful wire status.
+fn mutation_rows(result: MutationResult) -> PluginResponse {
     let mut row = BTreeMap::new();
     match result {
         MutationResult::Success { row_id } => {
@@ -748,11 +748,10 @@ fn mutation_response(result: MutationResult) -> osquery::ExtensionResponse {
             row.insert("status".to_string(), "constraint".to_string());
         }
     }
-    osquery::ExtensionResponse::new(ok, vec![row])
+    vec![row]
 }
 
-/// Parse a row ID field from a request map as `i64`.
-fn parse_row_id(req: &osquery::ExtensionPluginRequest, key: &str) -> Result<i64> {
+fn parse_row_id(req: &PluginRequest, key: &str) -> Result<i64> {
     req.get(key)
         .ok_or_else(|| crate::Error::Other(format!("missing {key}")))?
         .parse::<i64>()
@@ -761,15 +760,15 @@ fn parse_row_id(req: &osquery::ExtensionPluginRequest, key: &str) -> Result<i64>
 
 /// Parse the `"context"` field into a [`QueryContext`], falling back to
 /// an empty context on missing or malformed JSON.
-fn parse_mutation_context(req: &osquery::ExtensionPluginRequest) -> QueryContext {
+fn parse_mutation_context(req: &PluginRequest) -> QueryContext {
     req.get("context")
         .and_then(|s| serde_json::from_str::<QueryContext>(s).ok())
         .unwrap_or_default()
 }
 
 /// Build the route advertisement for a set of column definitions.
-fn build_routes(columns: &[ColumnDefinition]) -> osquery::ExtensionPluginResponse {
-    let mut routes = osquery::ExtensionPluginResponse::new();
+fn build_routes(columns: &[ColumnDefinition]) -> PluginResponse {
+    let mut routes = PluginResponse::new();
     for col in columns {
         routes.push(BTreeMap::from([
             (String::from("id"), String::from("column")),
@@ -781,41 +780,37 @@ fn build_routes(columns: &[ColumnDefinition]) -> osquery::ExtensionPluginRespons
     routes
 }
 
-/// Dispatch the `"generate"` action: parse context JSON, call the generate
-/// function, and wrap the result in an `ExtensionResponse`.
 fn handle_generate(
-    req: &osquery::ExtensionPluginRequest,
+    req: &PluginRequest,
     generate: impl FnOnce(QueryContext) -> Result<Table>,
-) -> osquery::ExtensionResponse {
-    let ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
-    match req.get("context") {
-        Some(s) => match serde_json::from_str::<QueryContext>(s) {
-            Ok(ctx) => match generate(ctx) {
-                Ok(table) => osquery::ExtensionResponse::new(ok, table),
-                Err(err) => {
-                    let msg = format!("error generating table: {err}");
-                    #[cfg(feature = "tracing")]
-                    tracing::error!("{}", msg);
-                    error_response(&msg)
-                }
-            },
-            Err(err) => {
-                let msg = format!("error parsing context JSON: {err}");
-                #[cfg(feature = "tracing")]
-                tracing::error!("{}", msg);
-                error_response(&msg)
-            }
-        },
-        None => error_response("missing query context"),
-    }
+) -> Result<PluginResponse> {
+    let Some(context) = req.get("context") else {
+        return Err(crate::Error::Other("missing query context".to_string()));
+    };
+    let ctx = serde_json::from_str::<QueryContext>(context).map_err(|err| {
+        let msg = format!("error parsing context JSON: {err}");
+        #[cfg(feature = "tracing")]
+        tracing::error!("{}", msg);
+        crate::Error::Other(msg)
+    })?;
+    generate(ctx).map_err(|err| match err {
+        // Pass Status through so implementors control the wire status code.
+        err @ crate::Error::Status { .. } => err,
+        err => {
+            let msg = format!("error generating table: {err}");
+            #[cfg(feature = "tracing")]
+            tracing::error!("{}", msg);
+            crate::Error::Other(msg)
+        }
+    })
 }
 
 /// Extract and parse the `json_value_array` field from a request, returning
-/// an error response on failure.
+/// failure rows when it is missing or malformed.
 fn extract_column_values(
-    req: &osquery::ExtensionPluginRequest,
+    req: &PluginRequest,
     action: &str,
-) -> result::Result<ColumnValues, osquery::ExtensionResponse> {
+) -> result::Result<ColumnValues, PluginResponse> {
     match req.get("json_value_array") {
         Some(s) => match parse_json_value_array(s) {
             Ok(v) => Ok(v),
@@ -823,34 +818,25 @@ fn extract_column_values(
                 let msg = format!("{action}: {e}");
                 #[cfg(feature = "tracing")]
                 tracing::error!("{}", msg);
-                Err(mutation_response(MutationResult::Failure(msg)))
+                Err(mutation_rows(MutationResult::Failure(msg)))
             }
         },
-        None => Err(mutation_response(MutationResult::Failure(
+        None => Err(mutation_rows(MutationResult::Failure(
             "missing json_value_array".to_string(),
         ))),
     }
 }
 
-/// Call a mutation callback and wrap the result in an `ExtensionResponse`.
-fn dispatch_mutation(action: &str, result: Result<MutationResult>) -> osquery::ExtensionResponse {
+fn dispatch_mutation(action: &str, result: Result<MutationResult>) -> PluginResponse {
     match result {
-        Ok(r) => mutation_response(r),
+        Ok(r) => mutation_rows(r),
         Err(e) => {
             let msg = format!("{action} failed: {e}");
             #[cfg(feature = "tracing")]
             tracing::error!("{}", msg);
-            mutation_response(MutationResult::Failure(msg))
+            mutation_rows(MutationResult::Failure(msg))
         }
     }
-}
-
-/// Build an error `ExtensionResponse` with status code 1.
-fn error_response(msg: &str) -> osquery::ExtensionResponse {
-    osquery::ExtensionResponse::new(
-        osquery::ExtensionStatus::new(1, msg.to_string(), None),
-        None,
-    )
 }
 
 /// Trait for osquery tables that support INSERT, UPDATE, and DELETE.
@@ -941,13 +927,10 @@ impl<T: WritableTable> WritableTablePlugin<T> {
 }
 
 impl<T: WritableTable> WritableTablePlugin<T> {
-    fn handle_insert(
-        &mut self,
-        req: &osquery::ExtensionPluginRequest,
-    ) -> osquery::ExtensionResponse {
+    fn handle_insert(&mut self, req: &PluginRequest) -> PluginResponse {
         let json_values = match extract_column_values(req, "insert") {
             Ok(v) => v,
-            Err(resp) => return resp,
+            Err(rows) => return rows,
         };
         let auto_rowid = req
             .get("auto_rowid")
@@ -964,19 +947,16 @@ impl<T: WritableTable> WritableTablePlugin<T> {
         dispatch_mutation("insert", self.inner.insert(request))
     }
 
-    fn handle_update(
-        &mut self,
-        req: &osquery::ExtensionPluginRequest,
-    ) -> osquery::ExtensionResponse {
+    fn handle_update(&mut self, req: &PluginRequest) -> PluginResponse {
         let row_id = match parse_row_id(req, "id") {
             Ok(id) => id,
             Err(e) => {
-                return mutation_response(MutationResult::Failure(format!("update: {e}")));
+                return mutation_rows(MutationResult::Failure(format!("update: {e}")));
             }
         };
         let json_values = match extract_column_values(req, "update") {
             Ok(v) => v,
-            Err(resp) => return resp,
+            Err(rows) => return rows,
         };
         let new_row_id = req.get("new_id").and_then(|s| s.parse::<i64>().ok());
         let context = parse_mutation_context(req);
@@ -990,14 +970,11 @@ impl<T: WritableTable> WritableTablePlugin<T> {
         dispatch_mutation("update", self.inner.update(request))
     }
 
-    fn handle_delete(
-        &mut self,
-        req: &osquery::ExtensionPluginRequest,
-    ) -> osquery::ExtensionResponse {
+    fn handle_delete(&mut self, req: &PluginRequest) -> PluginResponse {
         let row_id = match parse_row_id(req, "id") {
             Ok(id) => id,
             Err(e) => {
-                return mutation_response(MutationResult::Failure(format!("delete: {e}")));
+                return mutation_rows(MutationResult::Failure(format!("delete: {e}")));
             }
         };
         let context = parse_mutation_context(req);
@@ -1016,7 +993,7 @@ impl<T: WritableTable> OsqueryPlugin for WritableTablePlugin<T> {
         RegistryName::Table
     }
 
-    fn routes(&self) -> osquery::ExtensionPluginResponse {
+    fn routes(&self) -> PluginResponse {
         build_routes(&self.inner.columns())
     }
 
@@ -1024,18 +1001,15 @@ impl<T: WritableTable> OsqueryPlugin for WritableTablePlugin<T> {
         feature = "tracing",
         tracing::instrument(skip(self, req), fields(plugin = %self.inner.name()))
     )]
-    fn call(&mut self, req: osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse {
+    fn call(&mut self, req: PluginRequest) -> Result<PluginResponse> {
         match req.get("action").map(String::as_str) {
             Some("generate") => handle_generate(&req, |ctx| self.inner.generate(ctx)),
-            Some("columns") => {
-                let ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
-                osquery::ExtensionResponse::new(ok, self.routes())
-            }
-            Some("insert") => self.handle_insert(&req),
-            Some("update") => self.handle_update(&req),
-            Some("delete") => self.handle_delete(&req),
-            Some(action) => error_response(&format!("unknown action: {action}")),
-            None => error_response("missing action"),
+            Some("columns") => Ok(self.routes()),
+            Some("insert") => Ok(self.handle_insert(&req)),
+            Some("update") => Ok(self.handle_update(&req)),
+            Some("delete") => Ok(self.handle_delete(&req)),
+            Some(action) => Err(crate::Error::Other(format!("unknown action: {action}"))),
+            None => Err(crate::Error::Other("missing action".to_string())),
         }
     }
 }
@@ -1051,7 +1025,7 @@ impl<GenFunc: FnMut(QueryContext) -> Result<Table> + Send + Sync> OsqueryPlugin
         RegistryName::Table
     }
 
-    fn routes(&self) -> osquery::ExtensionPluginResponse {
+    fn routes(&self) -> PluginResponse {
         build_routes(&self.columns)
     }
 
@@ -1059,15 +1033,12 @@ impl<GenFunc: FnMut(QueryContext) -> Result<Table> + Send + Sync> OsqueryPlugin
         feature = "tracing",
         tracing::instrument(skip(self, req), fields(plugin = %self.name))
     )]
-    fn call(&mut self, req: osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse {
+    fn call(&mut self, req: PluginRequest) -> Result<PluginResponse> {
         match req.get("action").map(String::as_str) {
             Some("generate") => handle_generate(&req, |ctx| (self.generate)(ctx)),
-            Some("columns") => {
-                let ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
-                osquery::ExtensionResponse::new(ok, self.routes())
-            }
-            Some(action) => error_response(&format!("unknown action: {action}")),
-            None => error_response("missing action"),
+            Some("columns") => Ok(self.routes()),
+            Some(action) => Err(crate::Error::Other(format!("unknown action: {action}"))),
+            None => Err(crate::Error::Other("missing action".to_string())),
         }
     }
 }
@@ -1078,7 +1049,6 @@ mod tests {
 
     #[test]
     fn table_plugin() {
-        let status_ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
         let mut called_query_ctx = QueryContext::default();
         let mut plugin = TablePlugin::new(
             "mock",
@@ -1130,18 +1100,20 @@ mod tests {
         assert_eq!(plugin.registry_name(), RegistryName::Table);
         assert_eq!(tresp, plugin.routes());
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("columns"),
-        )]));
-        assert_eq!(resp.status.unwrap(), status_ok);
-        assert_eq!(tresp, resp.response.unwrap());
+        let rows = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("columns"),
+            )]))
+            .unwrap();
+        assert_eq!(tresp, rows);
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("generate")),
-            (String::from("context"), String::from("{}")),
-        ]));
-        assert_eq!(resp.status.unwrap(), status_ok);
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("generate")),
+                (String::from("context"), String::from("{}")),
+            ]))
+            .unwrap();
         assert_eq!(called_query_ctx.len(), QueryContext::default().len());
         assert_eq!(
             vec![BTreeMap::from([
@@ -1150,7 +1122,7 @@ mod tests {
                 (String::from("integer"), String::from("123")),
                 (String::from("text"), String::from("hello world")),
             ]),],
-            resp.response.unwrap()
+            rows
         );
     }
 
@@ -1170,51 +1142,52 @@ mod tests {
                 Err("foobar".into())
             },
         );
-        assert_eq!(
-            1,
-            plugin
-                .call(osquery::ExtensionPluginRequest::new())
-                .status
-                .unwrap()
-                .code
-                .unwrap()
-        );
-        assert_eq!(
-            1,
-            plugin
-                .call(osquery::ExtensionPluginRequest::from([(
-                    String::from("action"),
-                    String::from("bad")
-                )]))
-                .status
-                .unwrap()
-                .code
-                .unwrap()
-        );
+        plugin.call(PluginRequest::new()).unwrap_err();
+        plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("bad"),
+            )]))
+            .unwrap_err();
         // Bad context JSON
-        assert_eq!(
-            1,
-            plugin
-                .call(osquery::ExtensionPluginRequest::from([
-                    (String::from("action"), String::from("generate")),
-                    (String::from("context"), String::from("{[]}"))
-                ]))
-                .status
-                .unwrap()
-                .code
-                .unwrap()
-        );
+        plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("generate")),
+                (String::from("context"), String::from("{[]}")),
+            ]))
+            .unwrap_err();
         // generate returns Err
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("generate")),
-            (String::from("context"), String::from("{}")),
-        ]));
-        assert_eq!(1, resp.status.clone().unwrap().code.unwrap());
+        let err = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("generate")),
+                (String::from("context"), String::from("{}")),
+            ]))
+            .unwrap_err();
         assert_eq!(
             "error generating table: foobar".to_string(),
-            resp.status.unwrap().message.unwrap()
+            err.to_string()
         );
         assert_eq!(called, 1, "generate should have been called only once");
+    }
+
+    #[test]
+    fn generate_status_error_passes_through() {
+        let mut plugin = TablePlugin::new("mock", vec![ColumnDefinition::text("c")], |_| {
+            Err(crate::Error::Status {
+                code: 5,
+                message: "custom code".to_string(),
+            })
+        });
+        let err = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("generate")),
+                (String::from("context"), String::from("{}")),
+            ]))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Status { code: 5, .. }),
+            "Status errors must keep their code: {err}"
+        );
     }
 
     #[test]
@@ -1242,12 +1215,13 @@ mod tests {
                 ]
             }
         ]}"#;
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("generate")),
-            (String::from("context"), String::from(context)),
-        ]));
-        assert_eq!(0, resp.status.unwrap().code.unwrap());
-        assert_eq!(1, resp.response.unwrap().len());
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("generate")),
+                (String::from("context"), String::from(context)),
+            ]))
+            .unwrap();
+        assert_eq!(1, rows.len());
         assert_eq!(
             vec![
                 Constraint {
@@ -1793,7 +1767,7 @@ mod tests {
         }
     }
 
-    // ── Writable table tests ──────────────────────────────────────────
+    // Writable table tests────────
 
     #[test]
     fn parse_json_value_array_basic() {
@@ -1830,40 +1804,40 @@ mod tests {
     }
 
     #[test]
-    fn mutation_response_success() {
-        let resp = mutation_response(MutationResult::Success { row_id: Some(42) });
-        let row = &resp.response.unwrap()[0];
+    fn mutation_rows_success() {
+        let rows = mutation_rows(MutationResult::Success { row_id: Some(42) });
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "success");
         assert_eq!(row.get("id").unwrap(), "42");
     }
 
     #[test]
-    fn mutation_response_success_no_rowid() {
-        let resp = mutation_response(MutationResult::Success { row_id: None });
-        let row = &resp.response.unwrap()[0];
+    fn mutation_rows_success_no_rowid() {
+        let rows = mutation_rows(MutationResult::Success { row_id: None });
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "success");
         assert!(row.get("id").is_none());
     }
 
     #[test]
-    fn mutation_response_readonly() {
-        let resp = mutation_response(MutationResult::ReadOnly);
-        let row = &resp.response.unwrap()[0];
+    fn mutation_rows_readonly() {
+        let rows = mutation_rows(MutationResult::ReadOnly);
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "readonly");
     }
 
     #[test]
-    fn mutation_response_failure() {
-        let resp = mutation_response(MutationResult::Failure("bad data".to_string()));
-        let row = &resp.response.unwrap()[0];
+    fn mutation_rows_failure() {
+        let rows = mutation_rows(MutationResult::Failure("bad data".to_string()));
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "failure");
         assert_eq!(row.get("message").unwrap(), "bad data");
     }
 
     #[test]
-    fn mutation_response_constraint() {
-        let resp = mutation_response(MutationResult::Constraint);
-        let row = &resp.response.unwrap()[0];
+    fn mutation_rows_constraint() {
+        let rows = mutation_rows(MutationResult::Constraint);
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "constraint");
     }
 
@@ -1941,18 +1915,20 @@ mod tests {
     fn writable_table_insert() {
         let mut plugin = WritableTablePlugin::new(MockWritableTable::new());
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("insert")),
-            (
-                String::from("json_value_array"),
-                String::from(r#"["k1","v1"]"#),
-            ),
-            (String::from("auto_rowid"), String::from("true")),
-            (String::from("id"), String::from("1")),
-            (String::from("context"), String::from("{}")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("insert")),
+                (
+                    String::from("json_value_array"),
+                    String::from(r#"["k1","v1"]"#),
+                ),
+                (String::from("auto_rowid"), String::from("true")),
+                (String::from("id"), String::from("1")),
+                (String::from("context"), String::from("{}")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "success");
         assert_eq!(row.get("id").unwrap(), "1");
     }
@@ -1963,18 +1939,20 @@ mod tests {
         table.data.insert(5, ("k1".into(), "v1".into()));
         let mut plugin = WritableTablePlugin::new(table);
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("update")),
-            (String::from("id"), String::from("5")),
-            (String::from("new_id"), String::from("10")),
-            (
-                String::from("json_value_array"),
-                String::from(r#"["k2","v2"]"#),
-            ),
-            (String::from("context"), String::from("{}")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("update")),
+                (String::from("id"), String::from("5")),
+                (String::from("new_id"), String::from("10")),
+                (
+                    String::from("json_value_array"),
+                    String::from(r#"["k2","v2"]"#),
+                ),
+                (String::from("context"), String::from("{}")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "success");
     }
 
@@ -1984,13 +1962,15 @@ mod tests {
         table.data.insert(42, ("k1".into(), "v1".into()));
         let mut plugin = WritableTablePlugin::new(table);
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("delete")),
-            (String::from("id"), String::from("42")),
-            (String::from("context"), String::from("{}")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("delete")),
+                (String::from("id"), String::from("42")),
+                (String::from("context"), String::from("{}")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "success");
     }
 
@@ -2000,12 +1980,12 @@ mod tests {
         table.data.insert(1, ("greeting".into(), "hello".into()));
         let mut plugin = WritableTablePlugin::new(table);
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("generate")),
-            (String::from("context"), String::from("{}")),
-        ]));
-        assert_eq!(resp.status.unwrap().code.unwrap(), 0);
-        let rows = resp.response.unwrap();
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("generate")),
+                (String::from("context"), String::from("{}")),
+            ]))
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("key").unwrap(), "greeting");
     }
@@ -2014,12 +1994,14 @@ mod tests {
     fn writable_table_delete_missing_id() {
         let mut plugin = WritableTablePlugin::new(MockWritableTable::new());
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("delete"),
-        )]));
+        let rows = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("delete"),
+            )]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "failure");
         assert!(row.get("message").unwrap().contains("missing id"));
     }
@@ -2028,12 +2010,14 @@ mod tests {
     fn writable_table_update_missing_id() {
         let mut plugin = WritableTablePlugin::new(MockWritableTable::new());
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("update")),
-            (String::from("json_value_array"), String::from("[]")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("update")),
+                (String::from("json_value_array"), String::from("[]")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "failure");
         assert!(row.get("message").unwrap().contains("missing id"));
     }
@@ -2042,12 +2026,14 @@ mod tests {
     fn writable_table_insert_missing_values() {
         let mut plugin = WritableTablePlugin::new(MockWritableTable::new());
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("insert"),
-        )]));
+        let rows = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("insert"),
+            )]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "failure");
         assert!(
             row.get("message")
@@ -2060,12 +2046,14 @@ mod tests {
     fn writable_table_insert_invalid_json() {
         let mut plugin = WritableTablePlugin::new(MockWritableTable::new());
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("insert")),
-            (String::from("json_value_array"), String::from("not json")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("insert")),
+                (String::from("json_value_array"), String::from("not json")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "failure");
         assert!(
             row.get("message")
@@ -2078,13 +2066,15 @@ mod tests {
     fn writable_table_update_invalid_id() {
         let mut plugin = WritableTablePlugin::new(MockWritableTable::new());
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("update")),
-            (String::from("id"), String::from("not_a_number")),
-            (String::from("json_value_array"), String::from("[]")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("update")),
+                (String::from("id"), String::from("not_a_number")),
+                (String::from("json_value_array"), String::from("[]")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "failure");
         assert!(row.get("message").unwrap().contains("invalid id"));
     }
@@ -2118,16 +2108,20 @@ mod tests {
 
         let mut plugin = WritableTablePlugin::new(ContextChecker);
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("delete")),
-            (String::from("id"), String::from("1")),
-            (
-                String::from("context"),
-                String::from(r#"{"constraints":[{"name":"name","list":"","affinity":"TEXT"}]}"#),
-            ),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("delete")),
+                (String::from("id"), String::from("1")),
+                (
+                    String::from("context"),
+                    String::from(
+                        r#"{"constraints":[{"name":"name","list":"","affinity":"TEXT"}]}"#,
+                    ),
+                ),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "success");
     }
 
@@ -2157,12 +2151,14 @@ mod tests {
 
         let mut plugin = WritableTablePlugin::new(ConstraintTable);
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("insert")),
-            (String::from("json_value_array"), String::from("[]")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("insert")),
+                (String::from("json_value_array"), String::from("[]")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "constraint");
     }
 
@@ -2192,12 +2188,14 @@ mod tests {
 
         let mut plugin = WritableTablePlugin::new(ErrTable);
 
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("delete")),
-            (String::from("id"), String::from("1")),
-        ]));
+        let rows = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("delete")),
+                (String::from("id"), String::from("1")),
+            ]))
+            .unwrap();
 
-        let row = &resp.response.unwrap()[0];
+        let row = &rows[0];
         assert_eq!(row.get("status").unwrap(), "failure");
         assert!(row.get("message").unwrap().contains("storage unavailable"));
     }

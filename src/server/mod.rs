@@ -1,4 +1,4 @@
-use crate::osquery;
+use crate::{PluginRequest, PluginResponse, Result};
 use std::fmt;
 
 mod manager;
@@ -41,6 +41,12 @@ impl std::str::FromStr for RegistryName {
 }
 
 /// An osquery extension plugin.
+///
+/// Implementations handle requests from osquery using SDK-owned types. The
+/// dispatch layer converts results to the osquery wire format: `Ok(rows)`
+/// becomes a success response, [`Error::Status`](crate::Error::Status)
+/// preserves its code and message, and any other error becomes status 1
+/// with the error's message.
 pub trait OsqueryPlugin: Send + Sync {
     /// Return the plugin name (e.g. the table name it implements).
     fn name(&self) -> &str;
@@ -49,17 +55,30 @@ pub trait OsqueryPlugin: Send + Sync {
     fn registry_name(&self) -> RegistryName;
 
     /// Return the routes (column definitions, etc.) exposed by the plugin.
-    fn routes(&self) -> osquery::ExtensionPluginResponse {
-        osquery::ExtensionPluginResponse::new()
+    fn routes(&self) -> PluginResponse {
+        PluginResponse::new()
     }
 
-    /// Health check. Returns status OK by default.
-    fn ping(&self) -> osquery::ExtensionStatus {
-        osquery::ExtensionStatus::new(0, "OK".to_string(), None)
+    /// Health check. Succeeds by default.
+    ///
+    /// Advisory: osquery pings the extension as a whole, and the extension
+    /// answers without consulting individual plugins.
+    ///
+    /// # Errors
+    ///
+    /// Implementations may report an unhealthy plugin as an error.
+    fn ping(&self) -> Result<()> {
+        Ok(())
     }
 
-    /// Handle an incoming request from osquery.
-    fn call(&mut self, req: osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse;
+    /// Handle an incoming request from osquery and return response rows.
+    ///
+    /// # Errors
+    ///
+    /// Error conditions are implementor-defined; use
+    /// [`Error::Status`](crate::Error::Status) to control the status code
+    /// reported to osquery.
+    fn call(&mut self, req: PluginRequest) -> Result<PluginResponse>;
 
     /// Called when the plugin is being shut down.
     fn shutdown(&self) {}

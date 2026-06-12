@@ -411,9 +411,7 @@ mod tests {
         let request =
             osquery::ExtensionPluginRequest::from([("data".to_string(), payload.clone())]);
 
-        let response = client.call("table", "echo", request).unwrap();
-        assert_eq!(response.status.unwrap().code, Some(0));
-        let rows = response.response.unwrap();
+        let rows = client.call("table", "echo", request).unwrap();
         assert_eq!(rows[0].get("data"), Some(&payload));
     }
 

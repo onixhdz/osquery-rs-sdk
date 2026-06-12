@@ -1,7 +1,7 @@
 //! Create an osquery distributed plugin.
 //!
 //! See <https://osquery.readthedocs.io/en/latest/development/distributed-plugins/> for more.
-use crate::{OsqueryPlugin, RegistryName, Result, osquery};
+use crate::{OsqueryPlugin, PluginRequest, PluginResponse, RegistryName, Result};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use std::{collections::BTreeMap, result};
@@ -263,20 +263,21 @@ where
         feature = "tracing",
         tracing::instrument(skip(self, req), fields(plugin = %self.name))
     )]
-    fn call(&mut self, req: osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse {
-        let result: Result<_> = match req.get("action") {
+    fn call(&mut self, req: PluginRequest) -> Result<PluginResponse> {
+        match req.get("action") {
             // Call get_queries
-            Some(action) if action == "getQueries" => {
-                match (self.get_queries)() {
-                    Ok(response) => match serde_json::to_string(&response) {
-                        Ok(query_json) => Ok(osquery::ExtensionPluginResponse::from([
-                            BTreeMap::from([("results".to_string(), query_json)]),
-                        ])),
-                        Err(err) => Err(format!("error serializing queries: {err}").into()),
-                    },
-                    Err(err) => Err(format!("error getting queries: {err}").into()),
-                }
-            }
+            Some(action) if action == "getQueries" => match (self.get_queries)() {
+                Ok(response) => match serde_json::to_string(&response) {
+                    Ok(query_json) => Ok(PluginResponse::from([BTreeMap::from([(
+                        "results".to_string(),
+                        query_json,
+                    )])])),
+                    Err(err) => Err(format!("error serializing queries: {err}").into()),
+                },
+                // Pass Status through so implementors control the wire status code.
+                Err(err @ crate::Error::Status { .. }) => Err(err),
+                Err(err) => Err(format!("error getting queries: {err}").into()),
+            },
             // Call write_queries
             Some(action) if action == "writeResults" => match req.get("results") {
                 Some(results_json) => match serde_json::from_str::<QueriesResponse>(results_json) {
@@ -284,7 +285,8 @@ where
                         let query_resp: result::Result<Vec<QueryResponse>, _> = queries.try_into();
                         match query_resp {
                             Ok(results) => match (self.write_queries)(results) {
-                                Ok(()) => Ok(osquery::ExtensionPluginResponse::default()),
+                                Ok(()) => Ok(PluginResponse::default()),
+                                Err(err @ crate::Error::Status { .. }) => Err(err),
                                 Err(err) => Err(format!("error writing results: {err}").into()),
                             },
                             Err(err) => Err(format!("error writing results: {err}").into()),
@@ -296,17 +298,6 @@ where
             },
             Some(action) => Err(format!("unknown action: {action}").into()),
             None => Err(String::from("missing action").into()),
-        };
-
-        match result {
-            Ok(resp) => osquery::ExtensionResponse::new(
-                osquery::ExtensionStatus::new(0, String::from("OK"), None),
-                resp,
-            ),
-            Err(err) => {
-                let status = osquery::ExtensionStatus::new(1, err.to_string(), None);
-                osquery::ExtensionResponse::new(status, None)
-            }
         }
     }
 }
@@ -317,7 +308,6 @@ mod tests {
 
     #[test]
     fn distributed_plugin() {
-        let status_ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
         let mut plugin = DistributedPlugin::new(
             "mock",
             move || {
@@ -365,36 +355,32 @@ mod tests {
         assert_eq!(plugin.registry_name(), RegistryName::Distributed);
 
         // Call getQueries
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("getQueries"),
-        )]));
-        assert_eq!(resp.status.unwrap(), status_ok);
-        assert!(resp.response.is_some());
-
-        assert!(resp.response.clone().unwrap()[0].contains_key("results"));
+        let rows = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("getQueries"),
+            )]))
+            .unwrap();
+        assert!(rows[0].contains_key("results"));
         assert_eq!(
             r#"{"queries":{"query1":"select iso_8601 from time","query2":"select version from osquery_info","query3":"select foo from bar"},"discovery":{},"accelerate":5}"#,
-            resp.response.unwrap()[0].get("results").unwrap()
+            rows[0].get("results").unwrap()
         );
 
         // Call writeResults with osquery < v3.0 with stringy types
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
+        plugin.call(PluginRequest::from([
             (String::from("action"), String::from("writeResults")),
             (String::from("results"), String::from(r#"{"queries":{"query1":[{"iso_8601":"2017-07-10T22:08:40Z"}],"query2":[{"version":"2.4.0"}]},"statuses":{"query1":"0","query2":"0","query3":"1"}}"#)),
-        ]));
-        assert_eq!(resp.status.unwrap(), status_ok);
+        ])).unwrap();
         // Call writeResults with osquery > v3.0 with strong types
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
+        plugin.call(PluginRequest::from([
             (String::from("action"), String::from("writeResults")),
             (String::from("results"), String::from(r#"{"queries":{"query1":[{"iso_8601":"2017-07-10T22:08:40Z"}],"query2":[{"version":"2.4.0"}]},"statuses":{"query1":0,"query2":0,"query3":1}}"#)),
-        ]));
-        assert_eq!(resp.status.unwrap(), status_ok);
+        ])).unwrap();
     }
 
     #[test]
     fn distributed_plugin_accelerate_discovery() {
-        let status_ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
         let mut plugin = DistributedPlugin::new(
             "mock",
             move || {
@@ -411,20 +397,15 @@ mod tests {
             move |_| Ok(()),
         );
         // Call getQueries
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("getQueries"),
-        )]));
-        assert_eq!(resp.status.unwrap(), status_ok);
-        assert!(resp.response.is_some());
-        assert_eq!(resp.response.clone().unwrap().len(), 1);
+        let rows = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("getQueries"),
+            )]))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
         assert_eq!(
-            *resp
-                .response
-                .unwrap().first()
-                .unwrap()
-                .get("results")
-                .unwrap(),
+            *rows.first().unwrap().get("results").unwrap(),
             r#"{"queries":{"query1":"select * from time"},"discovery":{"query1":"select version from osquery_info where version = \"2.4.0\""},"accelerate":30}"#.to_string()
         );
     }
@@ -437,79 +418,91 @@ mod tests {
             |_| Err("writeResults failed".into()),
         );
         // Call with bad actions
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("bad"),
-        )]));
-        assert!(resp.response.is_none());
-        assert!(resp.status.is_some());
-        assert_eq!(resp.status.clone().unwrap().code.unwrap_or(0), 1);
-        assert_eq!(
-            resp.status.unwrap().message.unwrap(),
-            "unknown action: bad".to_string()
-        );
+        let err = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("bad"),
+            )]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "unknown action: bad");
 
         // Call with good action but getQueries fails
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("getQueries"),
-        )]));
-        assert!(resp.response.is_none());
-        assert!(resp.status.is_some());
-        assert_eq!(resp.status.clone().unwrap().code.unwrap_or(0), 1);
-        assert_eq!(
-            resp.status.unwrap().message.unwrap(),
-            "error getting queries: getQueries failed".to_string()
-        );
+        let err = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("getQueries"),
+            )]))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "error getting queries: getQueries failed");
         // Call with good action but bad results
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("writeResults")),
-            (
-                String::from("results"),
-                String::from(r#"{"statuses": {"query1": "foo"}}"#),
-            ),
-        ]));
-        assert!(resp.response.is_none());
-        assert!(resp.status.is_some());
-        assert_eq!(resp.status.clone().unwrap().code.unwrap_or(0), 1);
+        let err = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("writeResults")),
+                (
+                    String::from("results"),
+                    String::from(r#"{"statuses": {"query1": "foo"}}"#),
+                ),
+            ]))
+            .unwrap_err();
         assert_eq!(
-            resp.status.unwrap().message.unwrap(),
+            err.to_string(),
             "error deserializing results: invalid digit found in string at line 1 column 30"
                 .to_string()
         );
         // Call with good action but bad status type
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("writeResults")),
-            (
-                String::from("results"),
-                String::from(r#"{"statuses": {"query1": []}}"#),
-            ),
-        ]));
-        assert!(resp.response.is_none());
-        assert!(resp.status.is_some());
-        assert_eq!(resp.status.clone().unwrap().code.unwrap_or(0), 1);
+        let err = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("writeResults")),
+                (
+                    String::from("results"),
+                    String::from(r#"{"statuses": {"query1": []}}"#),
+                ),
+            ]))
+            .unwrap_err();
         assert_eq!(
-            resp.status.unwrap().message.unwrap(),
+            err.to_string(),
             "error deserializing results: invalid value [], expected int at line 1 column 27"
                 .to_string()
         );
         // Call with good action but missing queries field
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("writeResults")),
-            (String::from("results"), String::from(r#"{"statuses": {}}"#)),
-        ]));
-        assert!(resp.response.is_none());
-        assert!(resp.status.is_some());
-        assert_eq!(resp.status.clone().unwrap().code.unwrap_or(0), 1);
+        let err = plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("writeResults")),
+                (String::from("results"), String::from(r#"{"statuses": {}}"#)),
+            ]))
+            .unwrap_err();
         assert_eq!(
-            resp.status.unwrap().message.unwrap(),
-            "error deserializing results: missing field `queries` at line 1 column 16".to_string()
+            err.to_string(),
+            "error deserializing results: missing field `queries` at line 1 column 16"
         )
     }
 
     #[test]
+    fn distributed_status_error_passes_through() {
+        let mut plugin = DistributedPlugin::new(
+            "mock",
+            || {
+                Err(crate::Error::Status {
+                    code: 9,
+                    message: "custom code".to_string(),
+                })
+            },
+            |_| Ok(()),
+        );
+        let err = plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("getQueries"),
+            )]))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Status { code: 9, .. }),
+            "Status errors must keep their code: {err}"
+        );
+    }
+
+    #[test]
     fn distributed_plugin_with_stats_and_messages() {
-        let status_ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
         let mut plugin = DistributedPlugin::new(
             "mock",
             || Ok(QueriesRequest::new(BTreeMap::new())),
@@ -526,21 +519,21 @@ mod tests {
                 Ok(())
             },
         );
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("writeResults")),
-            (
-                String::from("results"),
-                String::from(
-                    r#"{"queries":{"q1":[{"col":"val"}]},"statuses":{"q1":0},"stats":{"q1":{"wall_time_ms":42,"user_time":10,"system_time":5,"memory":1024}},"messages":{"q1":"completed"}}"#,
+        plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("writeResults")),
+                (
+                    String::from("results"),
+                    String::from(
+                        r#"{"queries":{"q1":[{"col":"val"}]},"statuses":{"q1":0},"stats":{"q1":{"wall_time_ms":42,"user_time":10,"system_time":5,"memory":1024}},"messages":{"q1":"completed"}}"#,
+                    ),
                 ),
-            ),
-        ]));
-        assert_eq!(resp.status.unwrap(), status_ok);
+            ]))
+            .unwrap();
     }
 
     #[test]
     fn distributed_plugin_with_stringy_stats() {
-        let status_ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
         let mut plugin = DistributedPlugin::new(
             "mock",
             || Ok(QueriesRequest::new(BTreeMap::new())),
@@ -553,21 +546,21 @@ mod tests {
             },
         );
         // Stats with stringy ints (osquery < v3)
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("writeResults")),
-            (
-                String::from("results"),
-                String::from(
-                    r#"{"queries":{"q1":[]},"statuses":{"q1":"0"},"stats":{"q1":{"wall_time_ms":"100","user_time":"20","system_time":"0","memory":"0"}}}"#,
+        plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("writeResults")),
+                (
+                    String::from("results"),
+                    String::from(
+                        r#"{"queries":{"q1":[]},"statuses":{"q1":"0"},"stats":{"q1":{"wall_time_ms":"100","user_time":"20","system_time":"0","memory":"0"}}}"#,
+                    ),
                 ),
-            ),
-        ]));
-        assert_eq!(resp.status.unwrap(), status_ok);
+            ]))
+            .unwrap();
     }
 
     #[test]
     fn distributed_empty_string_results() {
-        let status_ok = osquery::ExtensionStatus::new(0, String::from("OK"), None);
         let mut plugin = DistributedPlugin::new(
             "mock",
             || Ok(QueriesRequest::new(BTreeMap::new())),
@@ -582,16 +575,17 @@ mod tests {
                 Ok(())
             },
         );
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([
-            (String::from("action"), String::from("writeResults")),
-            (
-                String::from("results"),
-                String::from(
-                    r#"{"queries":{"q1":"","q2":[{"c":"v"}]},"statuses":{"q1":0,"q2":0}}"#,
+        plugin
+            .call(PluginRequest::from([
+                (String::from("action"), String::from("writeResults")),
+                (
+                    String::from("results"),
+                    String::from(
+                        r#"{"queries":{"q1":"","q2":[{"c":"v"}]},"statuses":{"q1":0,"q2":0}}"#,
+                    ),
                 ),
-            ),
-        ]));
-        assert_eq!(resp.status.unwrap(), status_ok);
+            ]))
+            .unwrap();
     }
 
     #[test]
@@ -609,11 +603,12 @@ mod tests {
             |_| Ok(()),
         );
         // Verify closures work (not just fn pointers)
-        let resp = plugin.call(osquery::ExtensionPluginRequest::from([(
-            String::from("action"),
-            String::from("getQueries"),
-        )]));
-        assert_eq!(resp.status.unwrap().code.unwrap(), 0);
+        plugin
+            .call(PluginRequest::from([(
+                String::from("action"),
+                String::from("getQueries"),
+            )]))
+            .unwrap();
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

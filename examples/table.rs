@@ -45,7 +45,7 @@ fn main() -> Result<()> {
         }
         if let Some('\n' | '\r') = query.chars().next_back() {
             if query.len() > 1 {
-                println!("{:?}", client.query(&query)?.response.unwrap_or_default());
+                println!("{:?}", client.query(&query)?);
             }
             query.clear();
         }
