@@ -17,10 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Format check
         run: cargo fmt --check
@@ -34,32 +35,24 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install cargo-audit
-        run: |
-          curl -fsSL https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.1/cargo-audit-x86_64-unknown-linux-musl-v0.22.1.tgz \
-            | tar xz --strip-components=1 -C /usr/local/bin
-      - run: cargo-audit audit
-
+  # RustSec advisories are covered by cargo-deny ([advisories] in deny.toml).
   deny:
     name: Dependency Policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
 
   publish:
     name: Publish to crates.io
-    needs: [gate, audit, deny]
+    needs: [gate, deny]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Publish
         run: cargo publish
@@ -68,7 +61,7 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [gate, audit, deny]
+    needs: [gate, deny]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
