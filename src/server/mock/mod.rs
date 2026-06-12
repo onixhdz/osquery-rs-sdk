@@ -32,19 +32,11 @@ impl OsqueryPlugin for MockPlugin {
         osquery::ExtensionPluginResponse::new()
     }
 
-    fn ping(&self) -> osquery::ExtensionStatus {
-        todo!()
-    }
-
     fn call(&mut self, _req: osquery::ExtensionPluginRequest) -> osquery::ExtensionResponse {
         osquery::ExtensionResponse::new(
             osquery::ExtensionStatus::new(STATUS_CODE, None, None),
             None,
         )
-    }
-
-    fn shutdown(&self) {
-        todo!()
     }
 }
 
@@ -59,11 +51,15 @@ impl osquery::ExtensionSyncHandler for MockExtensionServerHandler {
 
     fn handle_call(
         &self,
-        registry: String,
-        item: String,
+        _registry: String,
+        _item: String,
         request: osquery::ExtensionPluginRequest,
     ) -> thrift::Result<osquery::ExtensionResponse> {
-        unimplemented!("call with {}, {}, {:?}", registry, item, request)
+        // Echo the request back so transport tests can verify round-trips.
+        Ok(osquery::ExtensionResponse::new(
+            osquery::ExtensionStatus::new(0, "OK".to_string(), None),
+            vec![request],
+        ))
     }
 
     fn handle_shutdown(&self) -> thrift::Result<()> {

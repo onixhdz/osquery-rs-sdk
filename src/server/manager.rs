@@ -28,6 +28,11 @@ const DEFAULT_TIMEOUT: time::Duration = time::Duration::from_secs(1);
 /// Default interval for pinging osquery to check connectivity.
 const DEFAULT_PING_INTERVAL: time::Duration = time::Duration::from_secs(5);
 
+/// How long shutdown waits for the osquery client lock before proceeding
+/// without it. An in-flight RPC wedged on a hung osquery connection holds
+/// the lock indefinitely; teardown must stay bounded regardless.
+const CLIENT_LOCK_DEADLINE: time::Duration = time::Duration::from_secs(1);
+
 /// A lightweight handle that can trigger a full shutdown of an
 /// [`ExtensionManagerServer`] from any thread.
 ///
@@ -107,6 +112,19 @@ pub struct ExtensionManagerServerBuilder<P: AsRef<Path>> {
     client: Option<Box<dyn client::ExtensionManager>>,
 }
 
+impl<P: AsRef<Path>> fmt::Debug for ExtensionManagerServerBuilder<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtensionManagerServerBuilder")
+            .field("name", &self.name)
+            .field("socket_path", &self.socket_path.as_ref())
+            .field("version", &self.version)
+            .field("timeout", &self.timeout)
+            .field("ping_interval", &self.ping_interval)
+            .field("client", &self.client.is_some())
+            .finish()
+    }
+}
+
 impl<P: AsRef<Path>> ExtensionManagerServerBuilder<P> {
     fn new(name: &str, socket_path: P) -> Self {
         Self {
@@ -126,9 +144,9 @@ impl<P: AsRef<Path>> ExtensionManagerServerBuilder<P> {
         self
     }
 
-    /// Set the timeout for connecting to the osquery socket.
-    /// Currently stored for forward-compatibility; will be used when the
-    /// transport layer supports connection timeouts.
+    /// Set how long to wait for the osquery socket to appear before
+    /// connecting. Useful when the extension starts before `osqueryd`
+    /// has created its socket.
     #[must_use]
     pub fn timeout(mut self, timeout: time::Duration) -> Self {
         self.timeout = timeout;
@@ -154,8 +172,9 @@ impl<P: AsRef<Path>> ExtensionManagerServerBuilder<P> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket path exceeds `MAX_SOCKET_PATH_CHARACTERS`
-    /// or if connecting to the `osqueryd` socket fails.
+    /// Returns an error if the socket path exceeds `MAX_SOCKET_PATH_CHARACTERS`,
+    /// if the socket does not appear within the configured timeout, or if
+    /// connecting to the `osqueryd` socket fails.
     pub fn build(self) -> Result<ExtensionManagerServer> {
         let path = self.socket_path.as_ref();
         let path_len = path.as_os_str().len();
@@ -172,11 +191,12 @@ impl<P: AsRef<Path>> ExtensionManagerServerBuilder<P> {
         let (osquery_client, client_ownership) = if let Some(c) = self.client {
             (c, ClientOwnership::Borrowed)
         } else {
-            let c = client::ExtensionManagerClient::connect_with_path(&self.socket_path)?;
-            (
-                Box::new(c) as Box<dyn client::ExtensionManager>,
-                ClientOwnership::Owned,
-            )
+            let c = client::ExtensionManagerClient::connect_with_timeout(
+                &self.socket_path,
+                self.timeout,
+            )?;
+            let owned: Box<dyn client::ExtensionManager> = Box::new(c);
+            (owned, ClientOwnership::Owned)
         };
 
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
@@ -191,7 +211,6 @@ impl<P: AsRef<Path>> ExtensionManagerServerBuilder<P> {
             server_stop_handle: None,
             version: self.version,
             listen_path: None,
-            timeout: self.timeout,
             ping_interval: self.ping_interval,
             shutdown_tx,
             shutdown_rx: Some(shutdown_rx),
@@ -212,8 +231,6 @@ pub struct ExtensionManagerServer {
     listen_path: Option<PathBuf>,
     uuid: Option<osquery::ExtensionRouteUUID>,
     server_stop_handle: Option<StopHandle>,
-    #[allow(dead_code)] // Stored for forward-compatibility with transport-layer timeouts.
-    timeout: time::Duration,
     ping_interval: time::Duration,
     shutdown_tx: ShutdownSignal,
     shutdown_rx: Option<mpsc::Receiver<Option<Error>>>,
@@ -228,7 +245,6 @@ impl fmt::Debug for ExtensionManagerServer {
             .field("listen_path", &self.listen_path)
             .field("uuid", &self.uuid)
             .field("client_ownership", &self.client_ownership)
-            .field("timeout", &self.timeout)
             .field("ping_interval", &self.ping_interval)
             .finish_non_exhaustive()
     }
@@ -236,15 +252,17 @@ impl fmt::Debug for ExtensionManagerServer {
 
 impl ExtensionManagerServer {
     /// Create a new extension management server communicating with osquery
-    /// over the socket at the provided path. If resolving the address or
-    /// connecting to the socket fails, this function will error.
+    /// over the socket at the provided path. Waits up to one second for the
+    /// socket to appear (extensions often start before `osqueryd` has created
+    /// it), then connects.
     ///
     /// For additional configuration (version, timeout, ping interval, custom client),
     /// use [`builder`](Self::builder) instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if connecting to the `osqueryd` socket at `socket_path` fails.
+    /// Returns an error if the socket does not appear in time or if connecting
+    /// to the `osqueryd` socket at `socket_path` fails.
     pub fn new<P: AsRef<Path>>(name: &str, socket_path: P) -> Result<Self> {
         Self::builder(name, socket_path).build()
     }
@@ -355,15 +373,13 @@ impl ExtensionManagerServer {
         }
 
         self.uuid = response.uuid;
+        let uuid = self.uuid.ok_or("uuid returned nil")?;
 
-        let mut listen_path = self.socket_path.clone();
-        self.listen_path =
-            if listen_path.set_extension(format!("em.{}", self.uuid.ok_or("uuid returned nil")?)) {
-                Some(listen_path)
-            } else {
-                return Err("socket_path is not valid file".into());
-            };
-        self.uuid.ok_or_else(|| "uuid returned nil".into())
+        // osquery expects the extension to listen on `<socket_path>.<uuid>`.
+        let mut listen_path = self.socket_path.clone().into_os_string();
+        listen_path.push(format!(".{uuid}"));
+        self.listen_path = Some(PathBuf::from(listen_path));
+        Ok(uuid)
     }
 
     /// Open a new thread and begin listening for requests from the osquery process.
@@ -397,42 +413,70 @@ impl ExtensionManagerServer {
         Ok(())
     }
 
-    /// Deregister the extension, stop the server, and close all sockets.
+    /// Try to acquire the osquery client lock, giving up after `deadline`
+    /// so a wedged in-flight RPC cannot block the caller indefinitely.
+    /// Returns `None` on timeout or a poisoned lock.
+    fn try_lock_client(
+        &self,
+        deadline: time::Duration,
+    ) -> Option<std::sync::MutexGuard<'_, Option<Box<dyn client::ExtensionManager>>>> {
+        let give_up = time::Instant::now() + deadline;
+        loop {
+            match self.osquery_client.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => return None,
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if time::Instant::now() >= give_up {
+                return None;
+            }
+            std::thread::sleep(time::Duration::from_millis(10));
+        }
+    }
+
+    /// Deregister the extension, stop the server, notify plugins via
+    /// [`OsqueryPlugin::shutdown`], and close all sockets.
+    ///
+    /// Teardown is best-effort and bounded: if the osquery client is wedged
+    /// in an RPC (e.g. a ping blocked on a hung connection), deregistration
+    /// and client close are skipped rather than waiting forever.
     /// This method is idempotent: calling it multiple times is safe and will
     /// not return an error on subsequent calls.
     ///
     /// # Errors
     ///
-    /// Returns an error if the osquery client lock is poisoned.
+    /// Currently never fails; the `Result` is kept for API stability.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub fn shutdown(&mut self) -> Result<()> {
-        let mut client_guard = self
-            .osquery_client
-            .lock()
-            .map_err(|_| "osquery client lock poisoned")?;
-
         let Some(uuid) = self.uuid.take() else {
             return Ok(());
         };
 
-        if let Some(client) = client_guard.as_mut() {
-            match client.deregister_extension(uuid) {
-                Err(err) => {
-                    // Log but don't fail -- we still want to stop the server
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!("error deregistering extension {}: {}", uuid, err);
-                    #[cfg(not(feature = "tracing"))]
-                    let _ = err;
+        match self.try_lock_client(CLIENT_LOCK_DEADLINE) {
+            Some(mut client_guard) => {
+                if let Some(client) = client_guard.as_mut() {
+                    match client.deregister_extension(uuid) {
+                        Err(err) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!("error deregistering extension {}: {}", uuid, err);
+                            #[cfg(not(feature = "tracing"))]
+                            let _ = err;
+                        }
+                        Ok(res) if res.code.unwrap_or_default() != 0 => {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                "status {} deregistering extension: {}",
+                                res.code.unwrap_or_default(),
+                                res.message.as_deref().unwrap_or_default()
+                            );
+                        }
+                        Ok(_) => {}
+                    }
                 }
-                Ok(res) if res.code.unwrap_or_default() != 0 => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(
-                        "status {} deregistering extension: {}",
-                        res.code.unwrap_or_default(),
-                        res.message.as_deref().unwrap_or_default()
-                    );
-                }
-                Ok(_) => {}
+            }
+            None => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!("skipping deregistration: osquery client unavailable");
             }
         }
 
@@ -440,12 +484,29 @@ impl ExtensionManagerServer {
             stop_handle.stop();
         }
 
-        // Only close the client if we own it
-        if self.client_ownership == ClientOwnership::Owned {
-            if let Some(client) = client_guard.as_mut() {
-                client.close();
+        if let Ok(registry) = self.registry.lock() {
+            for plugins in registry.values() {
+                for plugin in plugins.values() {
+                    if let Ok(plugin) = plugin.lock() {
+                        plugin.shutdown();
+                    }
+                }
             }
-            *client_guard = None;
+        }
+
+        if self.client_ownership == ClientOwnership::Owned {
+            match self.try_lock_client(CLIENT_LOCK_DEADLINE) {
+                Some(mut client_guard) => {
+                    if let Some(client) = client_guard.as_mut() {
+                        client.close();
+                    }
+                    *client_guard = None;
+                }
+                None => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("skipping client close: osquery client unavailable");
+                }
+            }
         }
 
         Ok(())
@@ -489,41 +550,64 @@ impl ExtensionManagerServer {
         self.start()?;
 
         // Watch for the osquery process going away. If so, initiate shutdown.
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(ping_interval);
+        // The thread sleeps on `ping_stop_rx` so it can be interrupted
+        // promptly when `run` begins its shutdown sequence.
+        let (ping_stop_tx, ping_stop_rx) = mpsc::channel::<()>();
+        let (ping_done_tx, ping_done_rx) = mpsc::channel::<()>();
+        let ping_thread = std::thread::spawn(move || {
+            'watch: loop {
+                match ping_stop_rx.recv_timeout(ping_interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break 'watch,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
 
-                if let Ok(mut guard) = osquery_client.lock() {
-                    match guard.as_mut() {
-                        // Client was set to None by shutdown -- exit the ping loop
-                        None => break,
-                        Some(client) => match client.ping() {
-                            Err(e) => {
-                                let msg = Error::from(e).context("extension ping failed");
-                                tx.send(Some(msg)).ok();
-                                break;
-                            }
-                            Ok(status) if status.code.unwrap_or_default() != 0 => {
-                                tx.send(Some(Error::from(format!(
-                                    "ping returned status {}",
-                                    status.code.unwrap_or_default()
-                                ))))
-                                .ok();
-                                break;
-                            }
-                            Ok(_) => {}
-                        },
-                    }
-                } else {
+                let Ok(mut guard) = osquery_client.lock() else {
                     tx.send(Some(Error::from("could not lock osquery client for ping")))
                         .ok();
-                    break;
+                    break 'watch;
+                };
+                // Client was cleared by shutdown -- nothing left to watch.
+                let Some(client) = guard.as_mut() else {
+                    break 'watch;
+                };
+                match client.ping() {
+                    Err(e) => {
+                        tx.send(Some(Error::from(e).context("extension ping failed")))
+                            .ok();
+                        break 'watch;
+                    }
+                    Ok(status) if status.code.unwrap_or_default() != 0 => {
+                        tx.send(Some(Error::from(format!(
+                            "ping returned status {}",
+                            status.code.unwrap_or_default()
+                        ))))
+                        .ok();
+                        break 'watch;
+                    }
+                    Ok(_) => {}
                 }
             }
+            ping_done_tx.send(()).ok();
         });
 
         let stop_signal = rx.recv();
-        self.shutdown().and_then(move |()| match stop_signal {
+        // Stop the ping watcher before tearing down so it does not race
+        // shutdown for the client lock, then collect it once shutdown
+        // finishes. The wait is bounded: a thread wedged inside a blocking
+        // RPC is detached instead of hanging run().
+        ping_stop_tx.send(()).ok();
+        let shutdown_result = self.shutdown();
+        match ping_done_rx.recv_timeout(CLIENT_LOCK_DEADLINE) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = ping_thread.join();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!("detaching ping thread wedged in an osquery RPC");
+            }
+        }
+
+        shutdown_result.and_then(move |()| match stop_signal {
             Ok(Some(err)) => Err(err),
             Err(_) => Err("shutdown signal error".into()),
             Ok(None) => Ok(()),
@@ -687,12 +771,18 @@ mod tests {
     use serial_test::serial;
 
     #[cfg(unix)]
-    const SOCKET: &str = "/var/osquery/osquery.em";
+    const DEFAULT_TEST_SOCKET: &str = "/var/osquery/osquery.em";
     #[cfg(windows)]
-    const SOCKET: &str = r"\\.\pipe\osquery.em";
+    const DEFAULT_TEST_SOCKET: &str = r"\\.\pipe\osquery.em";
+
+    /// Path to the osqueryd extension socket, overridable via `OSQUERY_SOCKET`
+    /// so ignored tests can run against an unprivileged osqueryd instance.
+    fn test_socket() -> String {
+        std::env::var("OSQUERY_SOCKET").unwrap_or_else(|_| DEFAULT_TEST_SOCKET.to_string())
+    }
 
     fn init_server() -> ExtensionManagerServer {
-        let mut server = ExtensionManagerServer::new("test_server", String::from(SOCKET)).unwrap();
+        let mut server = ExtensionManagerServer::new("test_server", test_socket()).unwrap();
         server.ping_interval = std::time::Duration::from_secs(1);
         server
     }
@@ -926,14 +1016,13 @@ mod tests {
     #[ignore = "requires a running osqueryd extension socket"]
     #[serial]
     fn builder_custom_options() {
-        let server = ExtensionManagerServer::builder("test_opts", String::from(SOCKET))
+        let server = ExtensionManagerServer::builder("test_opts", test_socket())
             .version("1.0.0")
             .timeout(time::Duration::from_secs(2))
             .ping_interval(time::Duration::from_secs(10))
             .build()
             .unwrap();
         assert_eq!(server.version, Some("1.0.0".to_string()));
-        assert_eq!(server.timeout, time::Duration::from_secs(2));
         assert_eq!(server.ping_interval, time::Duration::from_secs(10));
         assert!(
             server.client_ownership == ClientOwnership::Owned,
@@ -1029,5 +1118,127 @@ mod tests {
         let handle2 = handle.clone();
         drop(handle2);
         drop(handle);
+    }
+
+    /// Build a server backed by the given mock client, listening on a unique
+    /// per-test socket. Returns the server and its listen path (mock
+    /// registration always assigns uuid 1).
+    #[cfg(feature = "mock")]
+    fn init_mock_server(
+        test_name: &str,
+        client: crate::mock::MockExtensionManager,
+    ) -> (ExtensionManagerServer, std::path::PathBuf) {
+        #[cfg(unix)]
+        let socket = format!("/tmp/osquery_rs_sdk.manager.{test_name}.em");
+        #[cfg(windows)]
+        let socket = format!(r"\\.\pipe\osquery_rs_sdk.manager.{test_name}.em");
+        let listen_path = std::path::PathBuf::from(format!("{socket}.1"));
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_file(&listen_path).ok();
+
+        let server = ExtensionManagerServer::builder(test_name, socket)
+            .client(Box::new(client))
+            .ping_interval(std::time::Duration::from_millis(25))
+            .build()
+            .unwrap();
+        (server, listen_path)
+    }
+
+    #[cfg(feature = "mock")]
+    #[test]
+    fn shutdown_invokes_plugin_shutdown_hooks() {
+        use crate::plugin::LoggerPlugin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut server, listen_path) = init_mock_server(
+            "plugin_shutdown_hook",
+            crate::mock::MockExtensionManager::new(),
+        );
+
+        let flushed = Arc::new(AtomicBool::new(false));
+        let flushed_in_hook = Arc::clone(&flushed);
+        let logger = LoggerPlugin::new("hook_logger", |_typ, _log| Ok(()))
+            .with_shutdown(move || flushed_in_hook.store(true, Ordering::SeqCst));
+        server.register_plugin(logger).unwrap();
+
+        let handle = server.shutdown_handle();
+        let run_thread = std::thread::spawn(move || server.run());
+        wait_for_extension_server(&listen_path);
+
+        handle.shutdown();
+        run_thread.join().unwrap().unwrap();
+
+        assert!(
+            flushed.load(Ordering::SeqCst),
+            "plugin shutdown hook should fire during server shutdown"
+        );
+    }
+
+    /// A ping wedged inside a blocking RPC (holding the client mutex) must
+    /// not prevent `run()` from completing shutdown.
+    #[cfg(feature = "mock")]
+    #[test]
+    fn shutdown_completes_while_ping_is_wedged() {
+        use std::time::Duration;
+
+        let (ping_started_tx, ping_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut mock = crate::mock::MockExtensionManager::new();
+        mock.ping_fn = Some(Box::new(move || {
+            ping_started_tx.send(()).ok();
+            release_rx.recv().ok(); // Park, simulating a hung osquery socket.
+            Ok(osquery::ExtensionStatus::new(0, "OK".to_string(), None))
+        }));
+
+        let (mut server, listen_path) = init_mock_server("wedged_ping", mock);
+        let handle = server.shutdown_handle();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            done_tx.send(server.run()).ok();
+        });
+        wait_for_extension_server(&listen_path);
+
+        ping_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a ping should be in flight");
+        handle.shutdown();
+
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
+        // Unwedge regardless of outcome so the parked thread unwinds.
+        release_tx.send(()).ok();
+
+        outcome
+            .expect("run() must complete while a ping is wedged")
+            .expect("wedged-ping shutdown should still succeed");
+    }
+
+    #[cfg(feature = "mock")]
+    #[test]
+    fn ping_thread_stops_when_run_returns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pings = Arc::new(AtomicUsize::new(0));
+        let pings_in_fn = Arc::clone(&pings);
+        let mut mock = crate::mock::MockExtensionManager::new();
+        mock.ping_fn = Some(Box::new(move || {
+            pings_in_fn.fetch_add(1, Ordering::SeqCst);
+            Ok(osquery::ExtensionStatus::new(0, "OK".to_string(), None))
+        }));
+
+        let (mut server, listen_path) = init_mock_server("ping_thread_stop", mock);
+        let handle = server.shutdown_handle();
+        let run_thread = std::thread::spawn(move || server.run());
+        wait_for_extension_server(&listen_path);
+
+        handle.shutdown();
+        run_thread.join().unwrap().unwrap();
+
+        let pings_at_shutdown = pings.load(Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            pings_at_shutdown,
+            "ping thread should stop when run() returns"
+        );
     }
 }

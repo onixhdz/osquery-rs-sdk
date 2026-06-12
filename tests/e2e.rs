@@ -1,19 +1,16 @@
 //! End-to-end integration tests exercising the SDK as an actual user would.
 //!
 //! These tests require a running osqueryd with an extension socket at
-//! `/var/osquery/osquery.em`. Run them with:
+//! `/var/osquery/osquery.em` (override with the `OSQUERY_SOCKET` environment
+//! variable). Run them with:
 //!
 //! ```sh
 //! cargo test --all-features --test e2e -- --ignored
 //! ```
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::print_stdout,
-    clippy::semicolon_if_nothing_returned,
-    clippy::needless_pass_by_value
-)]
+// Panic/print allowances for test code live in clippy.toml; these pedantic
+// lints have no test toggle.
+#![allow(clippy::semicolon_if_nothing_returned, clippy::needless_pass_by_value)]
 
 use osquery_rs_sdk::{
     ColumnDefinition, ConfigPlugin, DeleteRequest, DistributedPlugin, ExtensionManagerClient,
@@ -26,9 +23,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(unix)]
-const OSQUERY_SOCKET: &str = "/var/osquery/osquery.em";
+const DEFAULT_OSQUERY_SOCKET: &str = "/var/osquery/osquery.em";
 #[cfg(windows)]
-const OSQUERY_SOCKET: &str = r"\\.\pipe\osquery.em";
+const DEFAULT_OSQUERY_SOCKET: &str = r"\\.\pipe\osquery.em";
+
+/// Path to the osqueryd extension socket, overridable via `OSQUERY_SOCKET`
+/// so the suite can run against an unprivileged osqueryd instance.
+fn osquery_socket() -> String {
+    std::env::var("OSQUERY_SOCKET").unwrap_or_else(|_| DEFAULT_OSQUERY_SOCKET.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // 1. Client: connect, query, query_rows, query_row
@@ -37,8 +40,13 @@ const OSQUERY_SOCKET: &str = r"\\.\pipe\osquery.em";
 #[test]
 #[ignore = "requires a running osqueryd extension socket"]
 fn client_connect_and_query() {
-    let mut client =
-        ExtensionManagerClient::connect().expect("should connect to osqueryd at default socket");
+    // Exercise the default-socket `connect()` unless the suite has been
+    // pointed at an alternate socket via `OSQUERY_SOCKET`.
+    let mut client = match std::env::var("OSQUERY_SOCKET") {
+        Ok(path) => ExtensionManagerClient::connect_with_path(path),
+        Err(_) => ExtensionManagerClient::connect(),
+    }
+    .expect("should connect to osqueryd");
 
     // ping
     let status = client.ping().expect("ping should succeed");
@@ -59,7 +67,7 @@ fn client_connect_and_query() {
 #[ignore = "requires a running osqueryd extension socket"]
 fn client_query_rows_and_query_row() {
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
 
     // query_rows
     let rows = client
@@ -84,7 +92,7 @@ fn client_query_rows_and_query_row() {
 #[ignore = "requires a running osqueryd extension socket"]
 fn client_connect_with_timeout() {
     let client =
-        ExtensionManagerClient::connect_with_timeout(OSQUERY_SOCKET, Duration::from_secs(5));
+        ExtensionManagerClient::connect_with_timeout(osquery_socket(), Duration::from_secs(5));
     assert!(client.is_ok(), "connect_with_timeout should succeed");
 }
 
@@ -92,7 +100,7 @@ fn client_connect_with_timeout() {
 #[ignore = "requires a running osqueryd extension socket"]
 fn client_close_then_ping_fails() {
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
     client.ping().expect("first ping should succeed");
     client.close();
     assert!(client.ping().is_err(), "ping after close should fail");
@@ -125,7 +133,7 @@ fn table_plugin_e2e() {
 
     // run() blocks, so spawn in background
     let handle = std::thread::spawn(move || {
-        let mut server = ExtensionManagerServer::new("e2e_table_ext", OSQUERY_SOCKET)
+        let mut server = ExtensionManagerServer::new("e2e_table_ext", osquery_socket())
             .expect("server should create");
         server
             .register_plugin(TablePlugin::new("e2e_table", columns, generate_fn))
@@ -137,7 +145,7 @@ fn table_plugin_e2e() {
     std::thread::sleep(Duration::from_secs(2));
 
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("client should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("client should connect");
 
     let rows = client
         .query_rows("SELECT * FROM e2e_table")
@@ -240,7 +248,7 @@ fn writable_table_plugin_e2e() {
     let plugin = WritableTablePlugin::new(E2eWritableTable::new());
 
     let handle = std::thread::spawn(move || {
-        let mut server = ExtensionManagerServer::new("e2e_writable_ext", OSQUERY_SOCKET)
+        let mut server = ExtensionManagerServer::new("e2e_writable_ext", osquery_socket())
             .expect("server should create");
         server
             .register_plugin(plugin)
@@ -251,7 +259,7 @@ fn writable_table_plugin_e2e() {
     std::thread::sleep(Duration::from_secs(2));
 
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("client should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("client should connect");
 
     // 1. Table should start empty
     let rows = client
@@ -339,12 +347,9 @@ fn writable_table_plugin_e2e() {
 #[ignore = "requires a running osqueryd extension socket"]
 fn config_plugin_e2e() {
     let call_count = Arc::new(Mutex::new(0u32));
-    let call_count_clone = call_count.clone();
 
     let generate = move || -> Result<BTreeMap<String, String>> {
-        *call_count_clone
-            .lock()
-            .expect("lock should not be poisoned") += 1;
+        *call_count.lock().expect("lock should not be poisoned") += 1;
         Ok(BTreeMap::from([(
             "e2e_config_source".into(),
             r#"{"schedule":{}}"#.into(),
@@ -352,7 +357,7 @@ fn config_plugin_e2e() {
     };
 
     let handle = std::thread::spawn(move || {
-        let mut server = ExtensionManagerServer::new("e2e_config_ext", OSQUERY_SOCKET)
+        let mut server = ExtensionManagerServer::new("e2e_config_ext", osquery_socket())
             .expect("server should create");
         server
             .register_plugin(ConfigPlugin::new("e2e_config", generate))
@@ -364,7 +369,7 @@ fn config_plugin_e2e() {
 
     // Verify registration by checking the extensions list
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
     let extensions = client.extensions().expect("extensions should succeed");
     assert!(
         !extensions.is_empty(),
@@ -391,18 +396,16 @@ fn config_plugin_e2e() {
 #[ignore = "requires a running osqueryd extension socket"]
 fn logger_plugin_e2e() {
     let logs = Arc::new(Mutex::new(Vec::<(LogType, String)>::new()));
-    let logs_clone = logs.clone();
 
     let log_fn = move |typ: LogType, msg: &str| -> Result<()> {
-        logs_clone
-            .lock()
+        logs.lock()
             .expect("lock should not be poisoned")
             .push((typ, msg.to_string()));
         Ok(())
     };
 
     let handle = std::thread::spawn(move || {
-        let mut server = ExtensionManagerServer::new("e2e_logger_ext", OSQUERY_SOCKET)
+        let mut server = ExtensionManagerServer::new("e2e_logger_ext", osquery_socket())
             .expect("server should create");
         server
             .register_plugin(LoggerPlugin::new("e2e_logger", log_fn))
@@ -414,7 +417,7 @@ fn logger_plugin_e2e() {
 
     // Verify registration via extensions list
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
     let extensions = client.extensions().expect("extensions should succeed");
 
     let our_ext = extensions
@@ -445,7 +448,7 @@ fn distributed_plugin_e2e() {
     let write_results = |_results: Vec<QueryResponse>| -> Result<()> { Ok(()) };
 
     let handle = std::thread::spawn(move || {
-        let mut server = ExtensionManagerServer::new("e2e_distributed_ext", OSQUERY_SOCKET)
+        let mut server = ExtensionManagerServer::new("e2e_distributed_ext", osquery_socket())
             .expect("server should create");
         server
             .register_plugin(DistributedPlugin::new(
@@ -461,7 +464,7 @@ fn distributed_plugin_e2e() {
 
     // Verify registration via extensions list
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
     let extensions = client.extensions().expect("extensions should succeed");
 
     let our_ext = extensions
@@ -483,7 +486,7 @@ fn distributed_plugin_e2e() {
 #[ignore = "requires a running osqueryd extension socket"]
 fn register_multiple_plugins_e2e() {
     let handle = std::thread::spawn(move || {
-        let mut server = ExtensionManagerServer::new("e2e_multi_ext", OSQUERY_SOCKET)
+        let mut server = ExtensionManagerServer::new("e2e_multi_ext", osquery_socket())
             .expect("server should create");
 
         let table = TablePlugin::new(
@@ -510,7 +513,7 @@ fn register_multiple_plugins_e2e() {
 
     // Query the table through osqueryd
     let mut client =
-        ExtensionManagerClient::connect_with_path(OSQUERY_SOCKET).expect("should connect");
+        ExtensionManagerClient::connect_with_path(osquery_socket()).expect("should connect");
 
     let rows = client
         .query_rows("SELECT * FROM e2e_multi_table")
@@ -539,7 +542,7 @@ fn register_multiple_plugins_e2e() {
 #[ignore = "requires a running osqueryd extension socket"]
 fn builder_pattern_e2e() {
     // Verify the builder compiles and connects successfully
-    let _server = ExtensionManagerServer::builder("e2e_builder_ext", OSQUERY_SOCKET)
+    let _server = ExtensionManagerServer::builder("e2e_builder_ext", osquery_socket())
         .version("1.0.0")
         .timeout(Duration::from_secs(3))
         .ping_interval(Duration::from_secs(5))

@@ -8,7 +8,7 @@
 //!
 //! # `MockExtensionManager`
 //!
-//! Implements [`ExtensionManager`](crate::client::ExtensionManager) with injectable
+//! Implements [`ExtensionManager`] with injectable
 //! function fields and invocation tracking. Unset functions return sensible defaults.
 //!
 //! ```rust,no_run

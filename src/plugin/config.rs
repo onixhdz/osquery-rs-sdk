@@ -33,6 +33,15 @@ pub struct ConfigPlugin<GenFunc: FnMut() -> Result<Config>> {
     gen_pack: Option<GenPackFn>,
 }
 
+impl<GenFunc: FnMut() -> Result<Config>> std::fmt::Debug for ConfigPlugin<GenFunc> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigPlugin")
+            .field("name", &self.name)
+            .field("gen_pack", &self.gen_pack.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<GenFunc: FnMut() -> Result<Config>> ConfigPlugin<GenFunc> {
     /// Create a new config plugin.
     ///

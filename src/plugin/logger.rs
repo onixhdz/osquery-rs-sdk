@@ -61,6 +61,14 @@ pub struct LoggerPlugin<LogFunc: FnMut(LogType, &str) -> Result<()>> {
     on_shutdown: Mutex<Option<ShutdownFn>>,
 }
 
+impl<LogFunc: FnMut(LogType, &str) -> Result<()>> fmt::Debug for LoggerPlugin<LogFunc> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoggerPlugin")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<LogFunc: FnMut(LogType, &str) -> Result<()>> LoggerPlugin<LogFunc> {
     /// Create a new logger plugin.
     ///

@@ -220,6 +220,18 @@ where
     write_queries: WriteFunc,
 }
 
+impl<GetFunc, WriteFunc> std::fmt::Debug for DistributedPlugin<GetFunc, WriteFunc>
+where
+    GetFunc: FnMut() -> Result<QueriesRequest>,
+    WriteFunc: FnMut(Vec<QueryResponse>) -> Result<()>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedPlugin")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<GetFunc, WriteFunc> DistributedPlugin<GetFunc, WriteFunc>
 where
     GetFunc: FnMut() -> Result<QueriesRequest>,

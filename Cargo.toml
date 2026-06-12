@@ -86,20 +86,36 @@ required-features = ["plugins", "mock"]
 
 [lints.rust]
 unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+trivial_casts = "warn"
+missing_debug_implementations = "warn"
+
+[lints.rustdoc]
+bare_urls = "warn"
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Selective overrides for pedantic lints that are too noisy for this crate
 module_name_repetitions = "allow"
 struct_excessive_bools = "allow"  # ColumnDefinition has 5 boolean flags by design (index, required, additional, optimized, hidden)
-# Restriction lints (not in pedantic, opted in explicitly)
+# Restriction lints (not in pedantic, opted in explicitly).
+# Panic sources: extension code runs inside the osquery process tree, so
+# panics take down the whole extension.
 unwrap_used = "warn"
 expect_used = "warn"
+panic = "warn"
+manual_assert = "warn"
+indexing_slicing = "warn"
+panic_in_result_fn = "warn"
+todo = "warn"
+unimplemented = "warn"
+# Diagnostics and polish.
 dbg_macro = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
-todo = "warn"
-unimplemented = "warn"
+redundant_clone = "warn"
 
 [profile.release]
 lto = "thin"

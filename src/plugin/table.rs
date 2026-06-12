@@ -256,10 +256,10 @@ impl<'de> Deserialize<'de> for QueryContext {
     {
         let mut constraints = BTreeMap::new();
         let helper: Value = Deserialize::deserialize(deserializer)?;
-        match &helper["constraints"] {
+        match helper.get("constraints").unwrap_or(&Value::Null) {
             Value::Array(raw_constraints) => {
                 for constraint in raw_constraints {
-                    match &constraint["name"] {
+                    match constraint.get("name").unwrap_or(&Value::Null) {
                         Value::String(name) => {
                             constraints.insert(
                                 name.clone(),
@@ -627,6 +627,15 @@ impl ColumnDefinition {
     }
 }
 
+impl<GenFunc: FnMut(QueryContext) -> Result<Table>> fmt::Debug for TablePlugin<GenFunc> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TablePlugin")
+            .field("name", &self.name)
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<GenFunc: FnMut(QueryContext) -> Result<Table>> TablePlugin<GenFunc> {
     /// Create a read-only `TablePlugin`.
     ///
@@ -914,6 +923,14 @@ pub trait WritableTable: Send + Sync {
 /// ```
 pub struct WritableTablePlugin<T: WritableTable> {
     inner: T,
+}
+
+impl<T: WritableTable> fmt::Debug for WritableTablePlugin<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WritableTablePlugin")
+            .field("name", &self.inner.name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: WritableTable> WritableTablePlugin<T> {
@@ -2091,6 +2108,7 @@ mod tests {
             fn update(&mut self, _req: UpdateRequest) -> crate::Result<MutationResult> {
                 Ok(MutationResult::Success { row_id: None })
             }
+            #[allow(clippy::panic_in_result_fn)] // Test double asserting on the parsed context.
             fn delete(&mut self, req: DeleteRequest) -> crate::Result<MutationResult> {
                 assert!(!req.context.is_empty());
                 assert!(req.context.contains_key("name"));

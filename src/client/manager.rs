@@ -207,9 +207,10 @@ impl ExtensionManagerClient {
     pub fn close(&mut self) {
         if let Some(stream) = self.stream.take() {
             #[cfg(unix)]
-            {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-            }
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            // Marks the connection closed for the transports' cloned handles.
+            #[cfg(windows)]
+            stream.close();
         }
     }
 
@@ -434,15 +435,21 @@ mod tests {
     use serial_test::serial;
 
     #[cfg(unix)]
-    pub static TEST_SOCKET: &str = "/var/osquery/osquery.em";
+    const DEFAULT_TEST_SOCKET: &str = "/var/osquery/osquery.em";
     #[cfg(windows)]
-    pub static TEST_SOCKET: &str = r"\\.\pipe\osquery.em";
+    const DEFAULT_TEST_SOCKET: &str = r"\\.\pipe\osquery.em";
+
+    /// Path to the osqueryd extension socket, overridable via `OSQUERY_SOCKET`
+    /// so ignored tests can run against an unprivileged osqueryd instance.
+    fn test_socket() -> String {
+        std::env::var("OSQUERY_SOCKET").unwrap_or_else(|_| DEFAULT_TEST_SOCKET.to_string())
+    }
 
     #[test]
     #[ignore = "requires a running osqueryd extension socket"]
     #[serial]
     fn query_rows() {
-        let mut client = ExtensionManagerClient::connect_with_path(TEST_SOCKET).unwrap();
+        let mut client = ExtensionManagerClient::connect_with_path(test_socket()).unwrap();
         client.query_rows("SELECT * FROM users").unwrap();
     }
 
@@ -450,7 +457,7 @@ mod tests {
     #[ignore = "requires a running osqueryd extension socket"]
     #[serial]
     fn query_row() {
-        let mut client = ExtensionManagerClient::connect_with_path(TEST_SOCKET).unwrap();
+        let mut client = ExtensionManagerClient::connect_with_path(test_socket()).unwrap();
         client.query_row("SELECT * FROM users limit 1").unwrap();
     }
 
@@ -469,9 +476,9 @@ mod tests {
 
     #[test]
     fn wait_for_socket_exists() {
-        // Use a path that exists (e.g., /tmp) to verify early return
-        let path = std::path::Path::new("/tmp");
-        let result = wait_for_socket(path, Duration::from_millis(100));
+        // Use a path that exists on every platform to verify early return.
+        let path = std::env::temp_dir();
+        let result = wait_for_socket(&path, Duration::from_millis(100));
         assert!(result.is_ok(), "should succeed for existing path");
     }
 
@@ -480,7 +487,7 @@ mod tests {
     #[serial]
     fn connect_with_timeout_connects() {
         let client =
-            ExtensionManagerClient::connect_with_timeout(TEST_SOCKET, Duration::from_secs(5));
+            ExtensionManagerClient::connect_with_timeout(test_socket(), Duration::from_secs(5));
         assert!(client.is_ok(), "should connect to running osqueryd");
     }
 
@@ -488,7 +495,7 @@ mod tests {
     #[ignore = "requires a running osqueryd extension socket"]
     #[serial]
     fn close_then_ping_errors() {
-        let mut client = ExtensionManagerClient::connect_with_path(TEST_SOCKET).unwrap();
+        let mut client = ExtensionManagerClient::connect_with_path(test_socket()).unwrap();
         client.ping().unwrap(); // should succeed
         client.close();
         // After close, ping should fail (transport is closed)

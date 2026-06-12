@@ -1,4 +1,4 @@
-.PHONY: setup fmt lint build test test-ignored audit deny check clean
+.PHONY: setup fmt lint doc build test test-ignored audit deny check clean
 
 # Install developer tools (cargo-audit, cargo-deny, cargo-nextest)
 setup:
@@ -11,6 +11,10 @@ fmt:
 # Lint with strict warnings
 lint:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Documentation check (broken links, bare URLs)
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # Build all features
 build:
@@ -33,4 +37,4 @@ deny:
 	cargo deny check
 
 # Run all CI checks locally
-check: fmt lint build test audit deny
+check: fmt lint doc build test audit deny
